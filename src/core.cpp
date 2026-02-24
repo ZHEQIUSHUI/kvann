@@ -1,4 +1,5 @@
 #include <kvann/core.h>
+#include <cmath>
 
 namespace kvann {
 

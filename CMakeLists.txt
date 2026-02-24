@@ -24,6 +24,7 @@ find_package(Threads REQUIRED)
 # 创建库目标（非 header-only）
 add_library(kvann
     src/core.cpp
+    src/index.cpp
     src/kvann.cpp
 )
 target_include_directories(kvann PUBLIC
@@ -41,20 +42,10 @@ if(BUILD_TESTS)
     target_link_libraries(test_v1 kvann)
     add_test(NAME v1_test COMMAND test_v1)
     
-    # V2 测试
-    add_executable(test_v2 tests/test_v2.cpp)
-    target_link_libraries(test_v2 kvann)
-    add_test(NAME v2_test COMMAND test_v2)
-    
     # user_data 测试
     add_executable(test_user_data tests/test_user_data.cpp)
     target_link_libraries(test_user_data kvann)
     add_test(NAME user_data_test COMMAND test_user_data)
-    
-    # V3 测试
-    add_executable(test_v3 tests/test_v3.cpp)
-    target_link_libraries(test_v3 kvann)
-    add_test(NAME v3_test COMMAND test_v3)
 endif()
 
 # 示例程序

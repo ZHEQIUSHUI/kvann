@@ -1,5 +1,5 @@
 /**
- * kvann V1 测试
+ * kvann 测试
  * 测试内容：
  * 1. 基本CRUD操作
  * 2. 搜索功能
@@ -171,7 +171,7 @@ void test_delta_layer() {
     
     // 检查所有结果都在插入的向量中
     for (const auto& r : results) {
-        TEST_ASSERT(r.key >= 0 && r.key < N, "Result key out of range");
+        TEST_ASSERT(r.key < static_cast<Key>(N), "Result key out of range");
     }
 }
 
@@ -565,7 +565,7 @@ void test_large_scale() {
 
 int main() {
     std::cout << "========================================" << std::endl;
-    std::cout << "kvann V1 Test Suite" << std::endl;
+    std::cout << "kvann Test Suite" << std::endl;
     std::cout << "========================================" << std::endl;
     
     try {
