@@ -106,40 +106,17 @@ struct IndexStats {
  * 余弦相似度计算（normalize + dot）
  * 输入向量必须是归一化的
  */
-inline float cosine_similarity(const float* a, const float* b, size_t dim) {
-    float dot = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        dot += a[i] * b[i];
-    }
-    return dot;
-}
+float cosine_similarity(const float* a, const float* b, size_t dim);
 
 /**
  * 向量归一化
  */
-inline void normalize_vector(float* vec, size_t dim) {
-    float norm = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        norm += vec[i] * vec[i];
-    }
-    norm = std::sqrt(norm);
-    if (norm > 0) {
-        for (size_t i = 0; i < dim; ++i) {
-            vec[i] /= norm;
-        }
-    }
-}
+void normalize_vector(float* vec, size_t dim);
 
 /**
  * 检查向量是否已归一化
  */
-inline bool is_normalized(const float* vec, size_t dim, float eps = 1e-5f) {
-    float norm = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        norm += vec[i] * vec[i];
-    }
-    return std::abs(norm - 1.0f) < eps;
-}
+bool is_normalized(const float* vec, size_t dim, float eps = 1e-5f);
 
 // ============================================================================
 // KV 存储层 - 真相源
