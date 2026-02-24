@@ -5,6 +5,7 @@
 #include <kvann/index.h>
 #include <iostream>
 #include <cstring>
+#include <random>
 
 using namespace kvann;
 
