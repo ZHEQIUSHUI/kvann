@@ -14,6 +14,19 @@
 
 namespace kvann {
 
+struct IndexConfig {
+    size_t max_elements = 1000000;
+    size_t delta_bruteforce_limit = 1000;
+    size_t delta_hnsw_threshold = 5000;
+
+    int hnsw_M = 16;
+    int hnsw_ef_construction = 200;
+    int hnsw_ef_search = 64;
+
+    size_t storage_block_size = 4096;
+    size_t lock_stripes = 64;
+};
+
 class Index {
 public:
     /**
@@ -23,6 +36,7 @@ public:
      * @param delta_threshold: Delta层使用brute-force的最大数量，超过则触发rebuild建议
      */
     Index(size_t dim, size_t max_elements = 1000000, size_t delta_threshold = 1000);
+    Index(size_t dim, const IndexConfig& config);
     ~Index();
 
     Index(const Index&) = delete;

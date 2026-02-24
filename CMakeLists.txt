@@ -46,6 +46,11 @@ if(BUILD_TESTS)
     add_executable(test_user_data tests/test_user_data.cpp)
     target_link_libraries(test_user_data kvann)
     add_test(NAME user_data_test COMMAND test_user_data)
+
+    # 优化项测试
+    add_executable(test_opt tests/test_opt.cpp)
+    target_link_libraries(test_opt kvann)
+    add_test(NAME opt_test COMMAND test_opt)
 endif()
 
 # 示例程序

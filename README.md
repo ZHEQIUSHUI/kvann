@@ -38,6 +38,12 @@ kvann 是一个工业级、可动态更新的向量检索引擎，采用 **KV-fi
 // 创建索引
 kvann::Index index(128, 100000);  // 128维，最大10万向量
 
+// 可选配置
+kvann::IndexConfig cfg;
+cfg.hnsw_ef_search = 128;
+cfg.delta_hnsw_threshold = 5000;
+kvann::Index tuned(128, cfg);
+
 // 插入向量
 std::vector<float> vec(128);
 // ... 填充向量数据 ...

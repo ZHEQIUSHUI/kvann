@@ -38,27 +38,35 @@ struct VectorMeta {
 
 class VectorStorage {
 public:
-    VectorStorage(size_t dim, size_t initial_capacity = 1024)
-        : dim_(dim), capacity_(initial_capacity), size_(0) {
-        data_ = alloc_aligned_floats(capacity_ * dim_);
-        if (!data_) {
-            throw std::bad_alloc();
+    VectorStorage(size_t dim, size_t initial_capacity = 1024, size_t block_size = 4096)
+        : dim_(dim),
+          block_size_(block_size),
+          capacity_(initial_capacity),
+          size_(0) {
+        if (block_size_ == 0) {
+            block_size_ = 4096;
         }
+        reserve_blocks_for_capacity(capacity_);
     }
 
     ~VectorStorage() {
-        free(data_);
+        for (auto* block : blocks_) {
+            free(block);
+        }
     }
 
     VectorStorage(const VectorStorage&) = delete;
     VectorStorage& operator=(const VectorStorage&) = delete;
 
     VectorStorage(VectorStorage&& other) noexcept
-        : data_(other.data_), dim_(other.dim_), capacity_(other.capacity_), size_(other.size_),
+        : blocks_(std::move(other.blocks_)),
+          dim_(other.dim_),
+          block_size_(other.block_size_),
+          capacity_(other.capacity_),
+          size_(other.size_),
           free_slots_(std::move(other.free_slots_)) {
-        other.data_ = nullptr;
-        other.size_ = 0;
         other.capacity_ = 0;
+        other.size_ = 0;
     }
 
     Slot allocate_slot() {
@@ -80,19 +88,20 @@ public:
     }
 
     void set_vector(Slot slot, const float* vec) {
-        std::memcpy(data_ + slot * dim_, vec, dim_ * sizeof(float));
+        float* dst = get_vector(slot);
+        std::memcpy(dst, vec, dim_ * sizeof(float));
     }
 
     const float* get_vector(Slot slot) const {
-        return data_ + slot * dim_;
+        return get_vector_ptr(slot);
     }
 
     float* get_vector(Slot slot) {
-        return data_ + slot * dim_;
+        return get_vector_ptr(slot);
     }
 
     float* get_buffer(Slot slot) {
-        return data_ + slot * dim_;
+        return get_vector_ptr(slot);
     }
 
     size_t dim() const { return dim_; }
@@ -102,35 +111,30 @@ public:
     void save(std::ofstream& out) const {
         out.write(reinterpret_cast<const char*>(&dim_), sizeof(dim_));
         out.write(reinterpret_cast<const char*>(&size_), sizeof(size_));
-        out.write(reinterpret_cast<const char*>(data_), size_ * dim_ * sizeof(float));
+        for (size_t i = 0; i < size_; ++i) {
+            const float* vec = get_vector(static_cast<Slot>(i));
+            out.write(reinterpret_cast<const char*>(vec), dim_ * sizeof(float));
+        }
     }
 
     void load(std::ifstream& in) {
         in.read(reinterpret_cast<char*>(&dim_), sizeof(dim_));
         in.read(reinterpret_cast<char*>(&size_), sizeof(size_));
 
-        if (data_) free(data_);
+        clear_blocks();
         capacity_ = (size_ > 0) ? size_ : 1;
-        data_ = alloc_aligned_floats(capacity_ * dim_);
-        if (!data_) {
-            throw std::bad_alloc();
-        }
+        reserve_blocks_for_capacity(capacity_);
 
-        if (size_ > 0) {
-            in.read(reinterpret_cast<char*>(data_), size_ * dim_ * sizeof(float));
+        for (size_t i = 0; i < size_; ++i) {
+            float* vec = get_vector(static_cast<Slot>(i));
+            in.read(reinterpret_cast<char*>(vec), dim_ * sizeof(float));
         }
     }
 
 private:
     void expand() {
         size_t new_capacity = capacity_ * 2;
-        float* new_data = alloc_aligned_floats(new_capacity * dim_);
-        if (!new_data) {
-            throw std::bad_alloc();
-        }
-        std::memcpy(new_data, data_, size_ * dim_ * sizeof(float));
-        free(data_);
-        data_ = new_data;
+        reserve_blocks_for_capacity(new_capacity);
         capacity_ = new_capacity;
     }
 
@@ -150,8 +154,36 @@ private:
         return static_cast<float*>(ptr);
     }
 
-    float* data_;
+    float* get_vector_ptr(Slot slot) const {
+        size_t block_index = slot / block_size_;
+        size_t offset = slot % block_size_;
+        if (block_index >= blocks_.size()) {
+            return nullptr;
+        }
+        return blocks_[block_index] + offset * dim_;
+    }
+
+    void reserve_blocks_for_capacity(size_t capacity) {
+        size_t needed_blocks = (capacity + block_size_ - 1) / block_size_;
+        while (blocks_.size() < needed_blocks) {
+            float* block = alloc_aligned_floats(block_size_ * dim_);
+            if (!block) {
+                throw std::bad_alloc();
+            }
+            blocks_.push_back(block);
+        }
+    }
+
+    void clear_blocks() {
+        for (auto* block : blocks_) {
+            free(block);
+        }
+        blocks_.clear();
+    }
+
+    std::vector<float*> blocks_;
     size_t dim_;
+    size_t block_size_;
     size_t capacity_;
     size_t size_;
     std::vector<Slot> free_slots_;
@@ -160,93 +192,139 @@ private:
 
 class KeyManager {
 public:
+    explicit KeyManager(size_t stripes)
+        : stripes_(stripes ? stripes : 1),
+          key_maps_(stripes_),
+          key_mutexes_(stripes_),
+          slot_mutex_() {}
+
     bool exists(Key key) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        auto it = key_map_.find(key);
-        return it != key_map_.end() && !it->second.tombstone;
+        auto& mutex = key_mutexes_[stripe(key)];
+        std::shared_lock<std::shared_mutex> lock(mutex);
+        auto& map = key_maps_[stripe(key)];
+        auto it = map.find(key);
+        return it != map.end() && !it->second.tombstone;
     }
 
     std::optional<VectorMeta> get_meta(Key key) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        auto it = key_map_.find(key);
-        if (it != key_map_.end()) {
+        auto& mutex = key_mutexes_[stripe(key)];
+        std::shared_lock<std::shared_mutex> lock(mutex);
+        auto& map = key_maps_[stripe(key)];
+        auto it = map.find(key);
+        if (it != map.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<Key> get_key_by_slot(Slot slot) const {
+        std::shared_lock<std::shared_mutex> lock(slot_mutex_);
+        auto it = slot_to_key_.find(slot);
+        if (it != slot_to_key_.end()) {
             return it->second;
         }
         return std::nullopt;
     }
 
     void put(Key key, const VectorMeta& meta) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        key_map_[key] = meta;
+        auto& mutex = key_mutexes_[stripe(key)];
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        key_maps_[stripe(key)][key] = meta;
+        {
+            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
+            slot_to_key_[meta.slot] = key;
+        }
     }
 
     bool del(Key key) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        auto it = key_map_.find(key);
-        if (it != key_map_.end()) {
+        auto& mutex = key_mutexes_[stripe(key)];
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        auto& map = key_maps_[stripe(key)];
+        auto it = map.find(key);
+        if (it != map.end()) {
             it->second.tombstone = true;
+            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
+            slot_to_key_.erase(it->second.slot);
             return true;
         }
         return false;
     }
 
     void update_meta(Key key, const VectorMeta& meta) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        key_map_[key] = meta;
+        auto& mutex = key_mutexes_[stripe(key)];
+        std::unique_lock<std::shared_mutex> lock(mutex);
+        key_maps_[stripe(key)][key] = meta;
+        {
+            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
+            slot_to_key_[meta.slot] = key;
+        }
     }
 
     std::vector<std::pair<Key, Slot>> get_all_live() const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::pair<Key, Slot>> result;
-        result.reserve(key_map_.size());
-        for (const auto& [key, meta] : key_map_) {
-            if (!meta.tombstone) {
-                result.emplace_back(key, meta.slot);
+        for (size_t i = 0; i < stripes_; ++i) {
+            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
+            for (const auto& [key, meta] : key_maps_[i]) {
+                if (!meta.tombstone) {
+                    result.emplace_back(key, meta.slot);
+                }
             }
         }
         return result;
     }
 
     void get_stats(size_t& total, size_t& live, size_t& tombstones) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        total = key_map_.size();
+        total = 0;
         live = 0;
         tombstones = 0;
-        for (const auto& [key, meta] : key_map_) {
-            if (meta.tombstone) {
-                tombstones++;
-            } else {
-                live++;
+        for (size_t i = 0; i < stripes_; ++i) {
+            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
+            total += key_maps_[i].size();
+            for (const auto& [key, meta] : key_maps_[i]) {
+                if (meta.tombstone) {
+                    tombstones++;
+                } else {
+                    live++;
+                }
             }
         }
     }
 
     void clear() {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        key_map_.clear();
+        for (size_t i = 0; i < stripes_; ++i) {
+            std::unique_lock<std::shared_mutex> lock(key_mutexes_[i]);
+            key_maps_[i].clear();
+        }
+        std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
+        slot_to_key_.clear();
     }
 
     void save(std::ofstream& out) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        size_t size = key_map_.size();
+        size_t size = 0;
+        for (size_t i = 0; i < stripes_; ++i) {
+            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
+            size += key_maps_[i].size();
+        }
         out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        for (const auto& [key, meta] : key_map_) {
-            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
-            out.write(reinterpret_cast<const char*>(&meta.slot), sizeof(meta.slot));
-            out.write(reinterpret_cast<const char*>(&meta.tombstone), sizeof(meta.tombstone));
-            out.write(reinterpret_cast<const char*>(&meta.version), sizeof(meta.version));
+        for (size_t i = 0; i < stripes_; ++i) {
+            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
+            for (const auto& [key, meta] : key_maps_[i]) {
+                out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+                out.write(reinterpret_cast<const char*>(&meta.slot), sizeof(meta.slot));
+                out.write(reinterpret_cast<const char*>(&meta.tombstone), sizeof(meta.tombstone));
+                out.write(reinterpret_cast<const char*>(&meta.version), sizeof(meta.version));
 
-            size_t user_data_size = meta.user_data.size();
-            out.write(reinterpret_cast<const char*>(&user_data_size), sizeof(user_data_size));
-            if (user_data_size > 0) {
-                out.write(reinterpret_cast<const char*>(meta.user_data.data()), user_data_size);
+                size_t user_data_size = meta.user_data.size();
+                out.write(reinterpret_cast<const char*>(&user_data_size), sizeof(user_data_size));
+                if (user_data_size > 0) {
+                    out.write(reinterpret_cast<const char*>(meta.user_data.data()), user_data_size);
+                }
             }
         }
     }
 
     void load(std::ifstream& in) {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        key_map_.clear();
+        clear();
         size_t size;
         in.read(reinterpret_cast<char*>(&size), sizeof(size));
         for (size_t i = 0; i < size; ++i) {
@@ -264,13 +342,19 @@ public:
                 in.read(reinterpret_cast<char*>(meta.user_data.data()), user_data_size);
             }
 
-            key_map_[key] = meta;
+            put(key, meta);
         }
     }
 
 private:
-    std::unordered_map<Key, VectorMeta> key_map_;
-    mutable std::shared_mutex mutex_;
+    size_t stripe(Key key) const { return key % stripes_; }
+
+    size_t stripes_;
+    std::vector<std::unordered_map<Key, VectorMeta>> key_maps_;
+    mutable std::vector<std::shared_mutex> key_mutexes_;
+
+    mutable std::shared_mutex slot_mutex_;
+    std::unordered_map<Slot, Key> slot_to_key_;
 };
 
 // ============================================================================
@@ -609,15 +693,27 @@ private:
 // Index 实现
 // ============================================================================
 
+struct DeltaEntry {
+    Slot slot;
+    uint64_t epoch;
+};
+
 struct Index::Impl {
-    Impl(size_t dim, size_t max_elements, size_t delta_threshold)
+    Impl(size_t dim, const IndexConfig& config)
         : dim_(dim),
-          max_elements_(max_elements),
-          delta_threshold_(delta_threshold),
-          storage_(dim, max_elements),
-          base_index_(dim, max_elements),
+          config_(config),
+          storage_(dim, config.max_elements, config.storage_block_size),
+          key_manager_(config.lock_stripes),
+          base_index_(dim, config.max_elements, config.hnsw_M, config.hnsw_ef_construction),
+          delta_index_(dim, config.max_elements, config.hnsw_M, config.hnsw_ef_construction),
+          delta_maps_(config.lock_stripes ? config.lock_stripes : 1),
+          delta_mutexes_(config.lock_stripes ? config.lock_stripes : 1),
+          delta_size_(0),
+          delta_hnsw_ready_(false),
+          delta_epoch_(0),
           rebuild_running_(false) {
         base_index_.set_vector_source(&storage_);
+        delta_index_.set_vector_source(&storage_);
     }
 
     ~Impl() {
@@ -629,8 +725,6 @@ struct Index::Impl {
     bool put_with_data(Key key, const float* vector, const void* user_data, size_t user_data_len) {
         Vector normalized_vec(vector, vector + dim_);
         normalize_vector(normalized_vec.data(), dim_);
-
-        std::unique_lock<std::shared_mutex> lock(write_mutex_);
 
         auto existing = key_manager_.get_meta(key);
 
@@ -647,9 +741,8 @@ struct Index::Impl {
                 meta.user_data.clear();
             }
             key_manager_.update_meta(key, meta);
-
-            delta_keys_.insert(key);
-            delta_slots_[key] = slot;
+            delta_upsert(key, slot);
+            maybe_add_delta_hnsw(slot);
 
             return true;
         }
@@ -669,23 +762,19 @@ struct Index::Impl {
             meta.user_data.assign(data_ptr, data_ptr + user_data_len);
         }
         key_manager_.put(key, meta);
-
-        delta_keys_.insert(key);
-        delta_slots_[key] = slot;
+        delta_upsert(key, slot);
+        maybe_add_delta_hnsw(slot);
 
         return true;
     }
 
     bool del(Key key) {
-        std::unique_lock<std::shared_mutex> lock(write_mutex_);
-
         if (!key_manager_.exists(key)) {
             return false;
         }
 
         key_manager_.del(key);
-        delta_keys_.erase(key);
-        delta_slots_.erase(key);
+        delta_erase(key);
         return true;
     }
 
@@ -706,33 +795,45 @@ struct Index::Impl {
         Vector normalized_query(query, query + dim_);
         normalize_vector(normalized_query.data(), dim_);
 
-        std::shared_lock<std::shared_mutex> lock(write_mutex_);
-
         std::vector<std::pair<Slot, float>> candidates;
 
-        if (!base_index_.empty()) {
-            auto base_candidates = base_index_.search(
-                normalized_query.data(),
-                topk * 2,
-                64
-            );
-            candidates.insert(candidates.end(), base_candidates.begin(), base_candidates.end());
+        {
+            std::shared_lock<std::shared_mutex> lock(base_mutex_);
+            if (!base_index_.empty()) {
+                auto base_candidates = base_index_.search(
+                    normalized_query.data(),
+                    topk * 2,
+                    config_.hnsw_ef_search
+                );
+                candidates.insert(candidates.end(), base_candidates.begin(), base_candidates.end());
+            }
         }
 
-        search_delta_brute_force(normalized_query.data(), topk * 2, candidates);
+        if (!delta_hnsw_ready_.load() && delta_size_.load() > config_.delta_hnsw_threshold) {
+            rebuild_delta_hnsw_if_needed();
+        }
+
+        if (should_use_delta_hnsw()) {
+            auto delta_candidates = delta_index_.search(
+                normalized_query.data(),
+                topk * 2,
+                config_.hnsw_ef_search,
+                [this](Slot slot) { return delta_slot_live(slot); }
+            );
+            candidates.insert(candidates.end(), delta_candidates.begin(), delta_candidates.end());
+        } else {
+            search_delta_brute_force(normalized_query.data(), topk * 2, candidates);
+        }
 
         return rerank(normalized_query.data(), candidates, topk);
     }
 
     void rebuild() {
-        std::unique_lock<std::shared_mutex> lock(write_mutex_);
-
         if (rebuild_running_.load()) {
             return;
         }
 
         rebuild_running_ = true;
-        lock.unlock();
 
         if (rebuild_thread_.joinable()) {
             rebuild_thread_.join();
@@ -756,10 +857,11 @@ struct Index::Impl {
         s.total_vectors = total;
         s.live_vectors = live;
         s.tombstone_count = tombstones;
-        s.base_count = base_index_.size();
-
-        std::shared_lock<std::shared_mutex> lock(write_mutex_);
-        s.delta_count = delta_keys_.size();
+        {
+            std::shared_lock<std::shared_mutex> lock(base_mutex_);
+            s.base_count = base_index_.size();
+        }
+        s.delta_count = delta_size_.load();
 
         s.tombstone_ratio = total > 0 ? (float)tombstones / total : 0;
         s.delta_ratio = live > 0 ? (float)s.delta_count / live : 0;
@@ -774,10 +876,19 @@ struct Index::Impl {
             throw std::runtime_error("Cannot open file for writing: " + path);
         }
 
+        const char magic[8] = {'K','V','A','N','N','0','1','\0'};
+        uint32_t version = 1;
+        uint32_t reserved = 0;
+        out.write(magic, sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+        out.write(reinterpret_cast<const char*>(&reserved), sizeof(reserved));
+
         size_t dim = dim_;
-        size_t max_elements = max_elements_;
+        size_t max_elements = config_.max_elements;
+        size_t block_size = config_.storage_block_size;
         out.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
         out.write(reinterpret_cast<const char*>(&max_elements), sizeof(max_elements));
+        out.write(reinterpret_cast<const char*>(&block_size), sizeof(block_size));
 
         key_manager_.save(out);
         storage_.save(out);
@@ -789,20 +900,132 @@ struct Index::Impl {
         key_manager_.load(in);
         storage_.load(in);
         rebuild_base_from_kv();
+        rebuild_delta_hnsw_if_needed();
     }
 
 private:
+    size_t delta_stripe(Key key) const {
+        size_t stripes = delta_maps_.size();
+        return stripes ? (key % stripes) : 0;
+    }
+
+    void delta_upsert(Key key, Slot slot) {
+        size_t idx = delta_stripe(key);
+        std::unique_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
+        auto& map = delta_maps_[idx];
+        auto it = map.find(key);
+        if (it == map.end()) {
+            delta_size_.fetch_add(1);
+        }
+        map[key] = {slot, delta_epoch_.fetch_add(1) + 1};
+    }
+
+    void delta_erase(Key key) {
+        size_t idx = delta_stripe(key);
+        std::unique_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
+        auto& map = delta_maps_[idx];
+        auto it = map.find(key);
+        if (it != map.end()) {
+            map.erase(it);
+            delta_size_.fetch_sub(1);
+        }
+    }
+
+    bool delta_contains_key(Key key) const {
+        size_t idx = delta_stripe(key);
+        std::shared_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
+        const auto& map = delta_maps_[idx];
+        return map.find(key) != map.end();
+    }
+
+    bool delta_slot_live(Slot slot) const {
+        auto key_opt = key_manager_.get_key_by_slot(slot);
+        if (!key_opt) return false;
+        return delta_contains_key(*key_opt);
+    }
+
+    void clear_delta_all() {
+        for (size_t i = 0; i < delta_maps_.size(); ++i) {
+            std::unique_lock<std::shared_mutex> lock(delta_mutexes_[i]);
+            delta_maps_[i].clear();
+        }
+        delta_size_.store(0);
+        {
+            std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
+            delta_index_.clear();
+            delta_hnsw_slots_.clear();
+            delta_hnsw_ready_.store(false);
+        }
+    }
+
+    void clear_delta_up_to_epoch(uint64_t epoch) {
+        for (size_t i = 0; i < delta_maps_.size(); ++i) {
+            std::unique_lock<std::shared_mutex> lock(delta_mutexes_[i]);
+            auto& map = delta_maps_[i];
+            for (auto it = map.begin(); it != map.end();) {
+                if (it->second.epoch <= epoch) {
+                    it = map.erase(it);
+                    delta_size_.fetch_sub(1);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (delta_size_.load() <= config_.delta_bruteforce_limit) {
+            std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
+            delta_index_.clear();
+            delta_hnsw_slots_.clear();
+            delta_hnsw_ready_.store(false);
+        }
+    }
+
+    bool should_use_delta_hnsw() const {
+        if (delta_size_.load() <= config_.delta_bruteforce_limit) {
+            return false;
+        }
+        return delta_hnsw_ready_.load() || delta_size_.load() > config_.delta_hnsw_threshold;
+    }
+
+    void rebuild_delta_hnsw_if_needed() {
+        if (delta_size_.load() <= config_.delta_hnsw_threshold) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
+        delta_index_.clear();
+        delta_hnsw_slots_.clear();
+        for (size_t i = 0; i < delta_maps_.size(); ++i) {
+            std::shared_lock<std::shared_mutex> map_lock(delta_mutexes_[i]);
+            for (const auto& [key, entry] : delta_maps_[i]) {
+                delta_index_.add(entry.slot);
+                delta_hnsw_slots_.insert(entry.slot);
+            }
+        }
+        delta_hnsw_ready_.store(true);
+    }
+
+    void maybe_add_delta_hnsw(Slot slot) {
+        if (!delta_hnsw_ready_.load()) {
+            if (delta_size_.load() > config_.delta_hnsw_threshold) {
+                rebuild_delta_hnsw_if_needed();
+            }
+            return;
+        }
+        std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
+        if (delta_hnsw_slots_.insert(slot).second) {
+            delta_index_.add(slot);
+        }
+    }
+
     void search_delta_brute_force(const float* query, int /* topk */,
                                   std::vector<std::pair<Slot, float>>& results) const {
-        for (Key key : delta_keys_) {
-            auto it = delta_slots_.find(key);
-            if (it == delta_slots_.end()) continue;
-
-            Slot slot = it->second;
-            const float* vec = storage_.get_vector(slot);
-            float sim = cosine_similarity(query, vec, dim_);
-
-            results.emplace_back(slot, 1.0f - sim);
+        for (size_t i = 0; i < delta_maps_.size(); ++i) {
+            std::shared_lock<std::shared_mutex> lock(delta_mutexes_[i]);
+            for (const auto& [key, entry] : delta_maps_[i]) {
+                Slot slot = entry.slot;
+                const float* vec = storage_.get_vector(slot);
+                float sim = cosine_similarity(query, vec, dim_);
+                results.emplace_back(slot, 1.0f - sim);
+            }
         }
     }
 
@@ -828,25 +1051,17 @@ private:
         std::vector<SearchResult> result;
         result.reserve(std::min((size_t)topk, unique_candidates.size()));
 
-        auto all_live = key_manager_.get_all_live();
-        std::unordered_map<Slot, Key> slot_to_key;
-        for (const auto& [key, slot] : all_live) {
-            slot_to_key[slot] = key;
-        }
-
         for (size_t i = 0; i < unique_candidates.size() && i < (size_t)topk; ++i) {
             Slot slot = unique_candidates[i].first;
             float score = unique_candidates[i].second;
-
-            auto it = slot_to_key.find(slot);
-            if (it != slot_to_key.end()) {
-                Key key = it->second;
-                auto meta = key_manager_.get_meta(key);
-                if (meta) {
-                    result.emplace_back(key, score, meta->user_data);
-                } else {
-                    result.emplace_back(key, score);
-                }
+            auto key_opt = key_manager_.get_key_by_slot(slot);
+            if (!key_opt) continue;
+            Key key = *key_opt;
+            auto meta = key_manager_.get_meta(key);
+            if (meta) {
+                result.emplace_back(key, score, meta->user_data);
+            } else {
+                result.emplace_back(key, score);
             }
         }
 
@@ -858,48 +1073,51 @@ private:
 
         auto live_keys = key_manager_.get_all_live();
 
-        HNSWIndex new_base(dim_, max_elements_);
+        uint64_t start_epoch = delta_epoch_.load();
+        HNSWIndex new_base(dim_, config_.max_elements, config_.hnsw_M, config_.hnsw_ef_construction);
         new_base.set_vector_source(&storage_);
 
         for (const auto& [key, slot] : live_keys) {
             new_base.add(slot);
         }
 
-        std::unique_lock<std::shared_mutex> lock(write_mutex_);
-        base_index_ = std::move(new_base);
-        delta_keys_.clear();
-        delta_slots_.clear();
+        {
+            std::unique_lock<std::shared_mutex> lock(base_mutex_);
+            base_index_ = std::move(new_base);
+        }
+        clear_delta_up_to_epoch(start_epoch);
 
         rebuild_running_ = false;
         std::cout << "[rebuild] Done. Base size: " << base_index_.size() << std::endl;
     }
 
     void rebuild_base_from_kv() {
-        base_index_.clear();
-
         auto live_keys = key_manager_.get_all_live();
+        std::unique_lock<std::shared_mutex> lock(base_mutex_);
+        base_index_.clear();
         for (const auto& [key, slot] : live_keys) {
             base_index_.add(slot);
         }
-
-        delta_keys_.clear();
-        delta_slots_.clear();
+        clear_delta_all();
     }
 
 private:
     size_t dim_;
-    size_t max_elements_;
-    size_t delta_threshold_;
-
+    IndexConfig config_;
     VectorStorage storage_;
     KeyManager key_manager_;
-
     HNSWIndex base_index_;
+    HNSWIndex delta_index_;
 
-    std::unordered_set<Key> delta_keys_;
-    std::unordered_map<Key, Slot> delta_slots_;
+    std::vector<std::unordered_map<Key, DeltaEntry>> delta_maps_;
+    mutable std::vector<std::shared_mutex> delta_mutexes_;
+    std::atomic<size_t> delta_size_;
+    std::atomic<bool> delta_hnsw_ready_;
+    std::unordered_set<Slot> delta_hnsw_slots_;
+    std::mutex delta_hnsw_mutex_;
+    std::atomic<uint64_t> delta_epoch_;
 
-    mutable std::shared_mutex write_mutex_;
+    mutable std::shared_mutex base_mutex_;
 
     std::atomic<bool> rebuild_running_;
     std::thread rebuild_thread_;
@@ -909,8 +1127,15 @@ private:
 // Index 公共接口
 // ============================================================================
 
-Index::Index(size_t dim, size_t max_elements, size_t delta_threshold)
-    : impl_(std::make_unique<Impl>(dim, max_elements, delta_threshold)) {}
+Index::Index(size_t dim, size_t max_elements, size_t delta_threshold) {
+    IndexConfig config;
+    config.max_elements = max_elements;
+    config.delta_bruteforce_limit = delta_threshold;
+    impl_ = std::make_unique<Impl>(dim, config);
+}
+
+Index::Index(size_t dim, const IndexConfig& config)
+    : impl_(std::make_unique<Impl>(dim, config)) {}
 
 Index::~Index() = default;
 
@@ -963,10 +1188,37 @@ std::unique_ptr<Index> Index::load(const std::string& path) {
         throw std::runtime_error("Cannot open file for reading: " + path);
     }
 
-    size_t dim, max_elements;
+    char magic[8] = {};
+    in.read(magic, sizeof(magic));
+    const char expected[8] = {'K','V','A','N','N','0','1','\0'};
+
+    if (std::memcmp(magic, expected, sizeof(magic)) == 0) {
+        uint32_t version = 0;
+        uint32_t reserved = 0;
+        in.read(reinterpret_cast<char*>(&version), sizeof(version));
+        in.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
+
+        size_t dim = 0;
+        size_t max_elements = 0;
+        size_t block_size = 0;
+        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+        in.read(reinterpret_cast<char*>(&max_elements), sizeof(max_elements));
+        in.read(reinterpret_cast<char*>(&block_size), sizeof(block_size));
+
+        IndexConfig config;
+        config.max_elements = max_elements;
+        config.storage_block_size = block_size;
+        auto index = std::make_unique<Index>(dim, config);
+        index->impl_->load_from_stream(in);
+        return index;
+    }
+
+    in.clear();
+    in.seekg(0, std::ios::beg);
+
+    size_t dim = 0, max_elements = 0;
     in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
     in.read(reinterpret_cast<char*>(&max_elements), sizeof(max_elements));
-
     auto index = std::make_unique<Index>(dim, max_elements);
     index->impl_->load_from_stream(in);
     return index;
