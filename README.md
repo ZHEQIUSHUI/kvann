@@ -169,3 +169,16 @@ kvann/
 ## 设计文档
 
 详见项目根目录的 `doc.md`，包含完整的需求规格与设计约束。
+### 本地序列化与冷启动
+
+支持本地序列化（`save`）与加载（`load`），用于冷启动直接恢复索引，无需重新构建。
+
+```cpp
+// 保存到本地文件
+index.save("/tmp/kvann.index");
+
+// 冷启动加载
+auto loaded = kvann::Index::load("/tmp/kvann.index");
+```
+
+注意：当前持久化面向冷启动恢复，不保证 crash-safe（无 WAL）。
