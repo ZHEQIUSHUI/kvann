@@ -117,7 +117,6 @@ IndexStats stats();
 struct SearchResult {
     Key key;                        // 向量唯一键
     float score;                    // 相似度分数（越高越相似）
-    std::vector<uint8_t> user_data; // 用户自定义数据
 };
 ```
 

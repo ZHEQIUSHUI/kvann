@@ -360,11 +360,7 @@ protected:
             if (it != slot_to_key.end()) {
                 Key key = it->second;
                 auto meta = key_manager_.get_meta(key);
-                if (meta) {
-                    result.emplace_back(key, score, meta->user_data);
-                } else {
-                    result.emplace_back(key, score);
-                }
+                result.emplace_back(key, score);
             }
         }
         

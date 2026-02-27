@@ -29,12 +29,9 @@ static constexpr Slot INVALID_SLOT = static_cast<Slot>(-1);
 struct SearchResult {
     Key key;
     float score;                // 相似度分数（越高越相似）
-    std::vector<uint8_t> user_data;  // 用户自定义数据
     
     SearchResult() : key(0), score(0) {}
     SearchResult(Key k, float s) : key(k), score(s) {}
-    SearchResult(Key k, float s, const std::vector<uint8_t>& data) 
-        : key(k), score(s), user_data(data) {}
     
     // 用于priority_queue（分数高的在前）
     bool operator<(const SearchResult& other) const {
