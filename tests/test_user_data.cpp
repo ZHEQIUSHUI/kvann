@@ -71,16 +71,17 @@ void test_search_with_user_data() {
     
     auto results = index.search(query.data(), 5);
     
-    // 验证返回的结果包含 user_data
+    // 验证可按需获取 user_data
     for (const auto& r : results) {
-        TEST_ASSERT(!r.user_data.empty(), "SearchResult should contain user_data");
+        auto data = index.get_user_data(r.key);
+        TEST_ASSERT(!data.empty(), "user_data should be retrievable by key");
         std::string expected_prefix = "data_for_key_";
-        std::string actual(reinterpret_cast<const char*>(r.user_data.data()));
+        std::string actual(reinterpret_cast<const char*>(data.data()));
         TEST_ASSERT(actual.find(expected_prefix) == 0, 
                     "user_data should start with expected prefix");
     }
     
-    std::cout << "  [PASS] search returns user_data" << std::endl;
+    std::cout << "  [PASS] search + get_user_data" << std::endl;
 }
 
 void test_update_user_data() {
@@ -157,13 +158,14 @@ void test_empty_user_data() {
     auto retrieved = index.get_user_data(1);
     TEST_ASSERT(retrieved.empty(), "user_data should be empty for put without data");
     
-    // 搜索也应该返回空的 user_data
+    // 搜索不应包含 user_data（按需获取）
     index.rebuild();
     index.wait_rebuild();
     
     auto results = index.search(vec.data(), 1);
     TEST_ASSERT(!results.empty(), "Should find the vector");
-    TEST_ASSERT(results[0].user_data.empty(), "SearchResult user_data should be empty");
+    auto data = index.get_user_data(results[0].key);
+    TEST_ASSERT(data.empty(), "user_data should be empty for put without data");
     
     std::cout << "  [PASS] empty user_data handling" << std::endl;
 }

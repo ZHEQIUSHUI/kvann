@@ -67,11 +67,12 @@ index.wait_rebuild();
 std::string metadata = "document_123:这是一篇文档";
 index.put_with_data(1, vec.data(), metadata.c_str(), metadata.size() + 1);
 
-// 搜索结果包含 user_data
+// 搜索结果默认不包含 user_data（按需获取）
 auto results = index.search(query_vec.data(), 10);
 for (const auto& r : results) {
-    std::string data(reinterpret_cast<const char*>(r.user_data.data()));
-    std::cout << "key=" << r.key << " data=" << data << std::endl;
+    auto data = index.get_user_data(r.key);
+    std::string data_str(reinterpret_cast<const char*>(data.data()));
+    std::cout << "key=" << r.key << " data=" << data_str << std::endl;
 }
 ```
 

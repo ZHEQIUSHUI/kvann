@@ -1057,12 +1057,7 @@ private:
             auto key_opt = key_manager_.get_key_by_slot(slot);
             if (!key_opt) continue;
             Key key = *key_opt;
-            auto meta = key_manager_.get_meta(key);
-            if (meta) {
-                result.emplace_back(key, score, meta->user_data);
-            } else {
-                result.emplace_back(key, score);
-            }
+            result.emplace_back(key, score);
         }
 
         return result;

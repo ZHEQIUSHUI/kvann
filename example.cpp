@@ -68,13 +68,14 @@ void example_user_data() {
     index.rebuild();
     index.wait_rebuild();
     
-    // 搜索并获取 user_data
+    // 搜索并按需获取 user_data
     auto query = random_vector(DIM, rng);
     auto results = index.search(query.data(), 5);
     
     std::cout << "搜索结果（含user_data）:" << std::endl;
     for (const auto& r : results) {
-        std::string user_data_str(reinterpret_cast<const char*>(r.user_data.data()));
+        auto data = index.get_user_data(r.key);
+        std::string user_data_str(reinterpret_cast<const char*>(data.data()));
         std::cout << "  key=" << r.key << " score=" << r.score 
                   << " data=" << user_data_str << std::endl;
     }
