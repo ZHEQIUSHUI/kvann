@@ -431,6 +431,66 @@ void test_get_payload_missing_returns_notfound() {
     TEST_ASSERT(st.code() == StatusCode::kNotFound, "expect NotFound");
 }
 
+// compact() reclaims slots after del/put churn so that subsequent inserts
+// don't trip Status::Full() near max_elements.
+void test_compact_reclaims_slots() {
+    constexpr std::size_t DIM = 16;
+    constexpr std::size_t CAP = 64;
+    Index idx(cfg_for(DIM, CAP));
+    std::mt19937 rng(1);
+
+    // Fill, then delete half. next_slot_ is now CAP and any further put fails.
+    for (std::size_t i = 0; i < CAP; ++i) {
+        auto v = random_vec(DIM, rng);
+        TEST_ASSERT(idx.put(static_cast<Key>(i), v.data()).ok(), "fill");
+    }
+    for (std::size_t i = 0; i < CAP / 2; ++i) {
+        TEST_ASSERT(idx.del(static_cast<Key>(i)).ok(), "del");
+    }
+    // Out of slots:
+    auto v = random_vec(DIM, rng);
+    auto st = idx.put(999, v.data());
+    TEST_ASSERT(!st.ok() && st.code() == StatusCode::kFull,
+                "expected Full before compact");
+
+    // Compact reclaims the deleted slots.
+    TEST_ASSERT(idx.compact().ok(), "compact ok");
+
+    auto stats = idx.stats();
+    TEST_ASSERT(stats.live_keys == CAP / 2, "live count preserved");
+    TEST_ASSERT(stats.tombstone_count == 0, "tombstones cleared");
+
+    // Now we can insert again (up to CAP).
+    int reinserted = 0;
+    for (std::size_t i = 0; i < CAP; ++i) {
+        auto v2 = random_vec(DIM, rng);
+        Key k = static_cast<Key>(10000 + i);
+        if (idx.put(k, v2.data()).ok()) ++reinserted;
+    }
+    TEST_ASSERT(reinserted == (int)(CAP / 2), "reinserts equal reclaimed slots");
+}
+
+void test_compact_preserves_search() {
+    constexpr std::size_t DIM = 32;
+    Index idx(cfg_for(DIM, 200));
+    std::mt19937 rng(7);
+    std::vector<std::vector<float>> vecs;
+    for (int i = 0; i < 100; ++i) {
+        vecs.push_back(random_vec(DIM, rng));
+        idx.put(static_cast<Key>(i), vecs.back().data());
+    }
+    idx.rebuild();
+
+    SearchParams sp; sp.topk = 1;
+    auto before = idx.search(vecs[42].data(), sp);
+    TEST_ASSERT(!before.empty() && before[0].key == 42, "self pre-compact");
+
+    TEST_ASSERT(idx.compact().ok(), "compact ok");
+
+    auto after = idx.search(vecs[42].data(), sp);
+    TEST_ASSERT(!after.empty() && after[0].key == 42, "self post-compact");
+}
+
 void test_get_payload_after_delete_returns_notfound() {
     Index idx(cfg_for(8, 100));
     std::vector<float> v(8, 0); v[0] = 1;
@@ -472,6 +532,8 @@ int main() {
         RUN_TEST(test_zero_vector_no_crash);
         RUN_TEST(test_get_payload_missing_returns_notfound);
         RUN_TEST(test_get_payload_after_delete_returns_notfound);
+        RUN_TEST(test_compact_reclaims_slots);
+        RUN_TEST(test_compact_preserves_search);
         std::cout << "\nALL EDGE TESTS PASSED\n";
         return 0;
     } catch (const std::exception& e) {

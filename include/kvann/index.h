@@ -132,6 +132,11 @@ public:
     Status rebuild_async();    // 后台触发，立即返回
     void   wait_rebuild() const;
 
+    // 重新分配 slot 编号到 0..N-1（消除 tombstone / del 留下的空洞）。
+    // 调用方必须保证独占访问：执行期间不可有并发 put/del/search。
+    // 时间复杂度 ≈ rebuild()，外加一次完整 snapshot 拷贝。
+    Status compact();
+
     // ---- introspection ----
     IndexStats stats() const;
     const IndexConfig& config() const;

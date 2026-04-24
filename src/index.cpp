@@ -988,12 +988,15 @@ struct Index::Impl {
         Slot slot = kInvalidSlot;
         bool is_new = false;
 
+        bool need_erase_on_fail = false;
         Status st = key_dir_.with_write(key, [&](KeyEntry& e, bool inserted) -> Status {
             if (inserted) {
                 Slot s = next_slot_.fetch_add(1, std::memory_order_acq_rel);
                 if (s >= static_cast<Slot>(config_.max_elements)) {
-                    // Slot is permanently leaked; concurrent fetch_add prevents
-                    // a safe rollback. Acceptable: callers must respect cap.
+                    // The KeyDir already inserted a default-constructed entry
+                    // for `key`. Erase it on the way out so snapshot_all() and
+                    // compact() never observe slot=kInvalidSlot ghosts.
+                    need_erase_on_fail = true;
                     return Status::Full();
                 }
                 e.slot = s;
@@ -1014,7 +1017,10 @@ struct Index::Impl {
             slot = e.slot;
             return Status::Ok();
         });
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+            if (need_erase_on_fail) key_dir_.erase(key);
+            return st;
+        }
 
         storage_.set_vector(slot, norm.data());
         slot_key_.set(slot, key);
@@ -1693,6 +1699,49 @@ Index::search_batch(const float* queries, size_t n, const SearchParams& params) 
 Status Index::rebuild()                 { return impl_->rebuild(); }
 Status Index::rebuild_async()           { return impl_->rebuild_async(); }
 void   Index::wait_rebuild() const      { impl_->wait_rebuild(); }
+
+Status Index::compact() {
+    impl_->wait_rebuild();
+    if (impl_->live_count_.load(std::memory_order_acquire) == 0) {
+        // Nothing live to keep; just reset to a fresh Impl.
+        IndexConfig cfg = impl_->config_;
+        impl_ = std::make_unique<Impl>(std::move(cfg));
+        return Status::Ok();
+    }
+
+    struct Entry {
+        Key k;
+        std::vector<float>   vec;
+        std::vector<uint8_t> payload;
+    };
+    std::vector<Entry> snapshot;
+    {
+        auto entries = impl_->key_dir_.snapshot_all();
+        snapshot.reserve(entries.size());
+        std::vector<float> tmp(impl_->config_.dim);
+        for (auto& [k, e] : entries) {
+            Entry ent;
+            ent.k = k;
+            ent.vec.resize(impl_->config_.dim);
+            impl_->storage_.copy_vector(e.slot, ent.vec.data());
+            ent.payload = std::move(e.payload);
+            snapshot.push_back(std::move(ent));
+        }
+    }
+
+    // Build a fresh Impl, replay live entries (which assigns dense slots
+    // 0..N-1 via next_slot_), then rebuild base graph.
+    IndexConfig cfg = impl_->config_;
+    auto fresh = std::make_unique<Impl>(cfg);
+    for (auto& e : snapshot) {
+        const void* p = e.payload.empty() ? nullptr : e.payload.data();
+        Status st = fresh->put(e.k, e.vec.data(), p, e.payload.size());
+        if (!st.ok()) return st;
+    }
+    fresh->rebuild();
+    impl_ = std::move(fresh);
+    return Status::Ok();
+}
 
 IndexStats         Index::stats() const  { return impl_->stats(); }
 const IndexConfig& Index::config() const { return impl_->config(); }
