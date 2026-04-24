@@ -44,6 +44,12 @@ struct IndexConfig {
     float auto_rebuild_tombstone_ratio = 0.30f;
     float auto_rebuild_delta_ratio     = 0.50f;
 
+    // Parallel rebuild: 0 = serial, 1 = auto (hardware_concurrency),
+    // >1 = exact thread count. Serial build gives best recall; parallel
+    // is much faster but recall may drop ~3-5% due to insertion-order
+    // interleaving. Default = auto.
+    int rebuild_threads = 1;
+
     // ---- logger ----
     // 不为空时所有内部日志（rebuild 等）都走此回调。默认 no-op。
     // level: "info" | "warn" | "error"

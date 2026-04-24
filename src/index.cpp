@@ -118,6 +118,23 @@ public:
         }
     }
 
+    // Pair-wise SIMD dot between two slots. Uses two seqlock counters so
+    // concurrent writes to either slot trigger a retry.
+    KVANN_FORCE_INLINE float dot_slots(Slot a, Slot b) const {
+        auto& va = version_[a];
+        auto& vb = version_[b];
+        for (;;) {
+            uint32_t v0a = va.load(std::memory_order_acquire);
+            uint32_t v0b = vb.load(std::memory_order_acquire);
+            if (KVANN_UNLIKELY((v0a | v0b) & 1u)) continue;
+            float d = simd::dot_f32(slot_ptr_const(a), slot_ptr_const(b), dim_);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            uint32_t v1a = va.load(std::memory_order_acquire);
+            uint32_t v1b = vb.load(std::memory_order_acquire);
+            if (KVANN_LIKELY(v0a == v1a && v0b == v1b)) return d;
+        }
+    }
+
     // Snapshot copy for rebuild: stable since we hold KeyDir read locks externally.
     void copy_vector(Slot slot, float* dst) const {
         auto& v = version_[slot];
@@ -335,6 +352,11 @@ public:
         level_dist_ = std::geometric_distribution<int>(1.0 / std::log(std::max(2, M)));
     }
 
+    int M() const { return M_; }
+    int M_max0() const { return M_max0_; }
+    int ef_construction() const { return ef_construction_; }
+    size_t max_elements() const { return max_elements_; }
+
     HnswGraph(const HnswGraph&) = delete;
     HnswGraph& operator=(const HnswGraph&) = delete;
 
@@ -347,52 +369,69 @@ public:
 
     // Vector source: caller-supplied function: (Slot) -> dot(slot, query)
     using DotFn = float(*)(const void* ctx, Slot s, const float* query);
+    // Pair-wise vector source: dot(slot_a, slot_b)
+    using PairDotFn = float(*)(const void* ctx, Slot a, Slot b);
 
     // Add a vector that is *already stored* in the vector source.
-    void add(Slot slot, const float* vec, const void* ctx, DotFn dot_fn) {
+    //
+    // Concurrency: multiple threads may call add() in parallel as long as
+    // they target distinct slots. enterpoint_/max_layer_ are atomic; the
+    // only serialization point is `clear()` (excluded by global_mutex_).
+    void add(Slot slot, const float* vec,
+             const void* ctx, DotFn dot_fn, PairDotFn pair_fn = nullptr) {
+        std::shared_lock global_lk(global_mutex_);  // exclude clear()
+
+        if (slot >= max_elements_) {
+            throw std::runtime_error("HNSW slot out of range");
+        }
         int level = sample_level();
 
-        // Reserve slot in upper map
-        bool first = false;
+        // Per-slot init: only this slot's writer touches its own data.
         {
-            std::unique_lock lk(global_mutex_);
-            if (slot >= max_elements_) {
-                throw std::runtime_error("HNSW slot out of range");
-            }
-            if (size_.load(std::memory_order_relaxed) == 0) first = true;
-            size_.fetch_add(1, std::memory_order_release);
+            std::lock_guard<std::shared_mutex> slk(slot_mutex(slot));
             node_top_[slot].store(level, std::memory_order_release);
             if (level > 0) {
                 upper_[slot].assign(level, {});
                 for (auto& v : upper_[slot]) v.reserve(static_cast<size_t>(M_));
             }
-            if (first) {
-                enterpoint_ = slot;
-                max_layer_ = level;
-                return;
-            }
         }
 
-        Slot ep = enterpoint_;
-        int top = max_layer_;
-        // Greedy descent on upper layers
+        // Claim "first inserter" via fetch_add returning 0.
+        size_t old_size = size_.fetch_add(1, std::memory_order_acq_rel);
+        if (old_size == 0) {
+            // First inserter — publish entrypoint atomically.
+            max_layer_.store(level, std::memory_order_release);
+            enterpoint_.store(slot, std::memory_order_release);
+            return;
+        }
+
+        // Wait for first inserter to publish enterpoint.
+        Slot ep;
+        while ((ep = enterpoint_.load(std::memory_order_acquire)) == kInvalidSlot) {
+            std::this_thread::yield();
+        }
+        int top = max_layer_.load(std::memory_order_acquire);
+
         for (int lc = top; lc > level; --lc) {
             ep = greedy_descend(ep, vec, lc, ctx, dot_fn);
         }
 
         for (int lc = std::min(level, top); lc >= 0; --lc) {
             auto cand = search_layer(vec, ep, ef_construction_, lc, ctx, dot_fn, nullptr);
-            auto neighbors = select_neighbors_heuristic(vec, cand, M_, ctx, dot_fn);
-            connect(slot, neighbors, lc, ctx, dot_fn);
+            auto neighbors = select_neighbors_heuristic(cand, M_, ctx, pair_fn);
+            connect(slot, neighbors, lc, ctx, pair_fn);
             if (!neighbors.empty()) ep = neighbors[0].slot;
         }
 
-        if (level > top) {
-            std::unique_lock lk(global_mutex_);
-            if (level > max_layer_) {
-                max_layer_ = level;
-                enterpoint_ = slot;
+        // CAS-update enterpoint if I'm the new top layer.
+        int cur_top = max_layer_.load(std::memory_order_acquire);
+        while (level > cur_top) {
+            if (max_layer_.compare_exchange_weak(cur_top, level,
+                                                 std::memory_order_acq_rel)) {
+                enterpoint_.store(slot, std::memory_order_release);
+                break;
             }
+            // cur_top reloaded by CAS failure; loop checks again.
         }
     }
 
@@ -404,20 +443,14 @@ public:
 
     std::vector<SearchHit> search(const float* query, int ef, int /*topk*/,
                                   const void* ctx, DotFn dot_fn) const {
-        Slot ep;
-        int top;
-        {
-            // Re-check empty() inside the lock so a concurrent clear()/swap
-            // between the user's empty() check and our read of enterpoint_
-            // can't hand us an invalid slot.
-            std::shared_lock lk(global_mutex_);
-            if (size_.load(std::memory_order_relaxed) == 0 ||
-                enterpoint_ == kInvalidSlot) {
-                return {};
-            }
-            ep = enterpoint_;
-            top = max_layer_;
+        // shared_lock excludes clear(); enterpoint_/max_layer_ are atomic but
+        // we still need to ensure they're not reset between read and use.
+        std::shared_lock lk(global_mutex_);
+        Slot ep = enterpoint_.load(std::memory_order_acquire);
+        if (size_.load(std::memory_order_acquire) == 0 || ep == kInvalidSlot) {
+            return {};
         }
+        int top = max_layer_.load(std::memory_order_acquire);
 
         for (int lc = top; lc > 0; --lc) {
             ep = greedy_descend(ep, query, lc, ctx, dot_fn);
@@ -459,8 +492,8 @@ public:
             out.insert(out.end(), b, b + n);
         };
 
-        uint32_t ep = enterpoint_;
-        int32_t  ml = max_layer_;
+        uint32_t ep = enterpoint_.load(std::memory_order_acquire);
+        int32_t  ml = max_layer_.load(std::memory_order_acquire);
         uint64_t sz = size_.load(std::memory_order_acquire);
         put(&ep, sizeof(ep));
         put(&ml, sizeof(ml));
@@ -518,8 +551,8 @@ public:
         take(&ml, sizeof(ml));
         take(&sz, sizeof(sz));
         take(&n_nodes, sizeof(n_nodes));
-        enterpoint_ = ep;
-        max_layer_  = ml;
+        enterpoint_.store(ep, std::memory_order_release);
+        max_layer_.store(ml, std::memory_order_release);
         size_.store(sz, std::memory_order_release);
 
         for (uint64_t i = 0; i < n_nodes; ++i) {
@@ -556,8 +589,8 @@ public:
         for (auto& d : layer0_deg_) d.store(0, std::memory_order_relaxed);
         for (auto& t : node_top_) t.store(-1, std::memory_order_relaxed);
         for (auto& u : upper_) u.clear();
-        enterpoint_ = kInvalidSlot;
-        max_layer_ = -1;
+        enterpoint_.store(kInvalidSlot, std::memory_order_release);
+        max_layer_.store(-1, std::memory_order_release);
         size_.store(0, std::memory_order_release);
     }
 
@@ -572,7 +605,7 @@ private:
         return lvl;
     }
 
-    KVANN_FORCE_INLINE std::mutex& slot_mutex(Slot s) const {
+    KVANN_FORCE_INLINE std::shared_mutex& slot_mutex(Slot s) const {
         return mutex_stripes_[s & (kStripeN - 1)];
     }
 
@@ -592,9 +625,11 @@ private:
         return static_cast<int>(u[layer - 1].size());
     }
 
-    // Returns a snapshot of neighbor slots at (s, layer). Single call sites copy
-    // into a small local buffer to avoid holding any lock during distance calls.
+    // Returns a snapshot of neighbor slots at (s, layer). Takes a shared
+    // per-slot lock so concurrent shrink (which rewrites the arena in-place)
+    // can't be observed mid-update.
     std::vector<Slot> snapshot_neighbors(Slot s, int layer) const {
+        std::shared_lock<std::shared_mutex> lk(slot_mutex(s));
         if (layer == 0) {
             uint8_t deg = layer0_deg_[s].load(std::memory_order_acquire);
             std::vector<Slot> out(deg);
@@ -604,8 +639,6 @@ private:
             }
             return out;
         }
-        // Upper layers: take per-slot lock briefly to copy.
-        std::lock_guard<std::mutex> lk(slot_mutex(s));
         const auto& u = upper_[s];
         if (layer - 1 >= static_cast<int>(u.size())) return {};
         return u[layer - 1];
@@ -692,35 +725,69 @@ private:
         return best;
     }
 
-    // Neighbor selection — pick M closest. (Pairwise diversity heuristic
-    // requires slot->vec ptr access via DotFn which currently only takes a
-    // query buffer; revisit when DotFn is generalized.)
+    // HNSW paper Algorithm 4 — heuristic neighbor selection with diversity.
+    // Pick a candidate `e` only if for every already-chosen neighbor `r`,
+    // dist(e, query) < dist(e, r). This avoids picking many neighbors that
+    // are mutually close and biases for "spread-out" connectivity → much
+    // better recall than naive top-M-by-distance.
+    //
+    // Falls back to pure top-M if pair_fn is unavailable (e.g. unit tests).
     std::vector<Cand> select_neighbors_heuristic(
-            const float* /*query*/,
             std::priority_queue<Cand, std::vector<Cand>, CmpFar> cand,
-            int M, const void* /*ctx*/, DotFn /*dot_fn*/) const {
+            int M, const void* ctx, PairDotFn pair_fn) const {
         std::vector<Cand> sorted;
         sorted.reserve(cand.size());
         while (!cand.empty()) { sorted.push_back(cand.top()); cand.pop(); }
         std::sort(sorted.begin(), sorted.end(),
                   [](const Cand& a, const Cand& b) { return a.dist < b.dist; });
-        if (static_cast<int>(sorted.size()) > M) sorted.resize(static_cast<size_t>(M));
-        return sorted;
+
+        if (!pair_fn) {
+            if (static_cast<int>(sorted.size()) > M) sorted.resize(M);
+            return sorted;
+        }
+
+        std::vector<Cand> chosen;
+        std::vector<Cand> discarded;
+        chosen.reserve(static_cast<size_t>(M));
+        for (const Cand& e : sorted) {
+            if (static_cast<int>(chosen.size()) >= M) break;
+            bool keep = true;
+            for (const Cand& r : chosen) {
+                // d(e, r) = 1 - cos(e_vec, r_vec)
+                float d_er = 1.0f - pair_fn(ctx, e.slot, r.slot);
+                if (d_er < e.dist) {
+                    // r is closer to e than the query is → e is in r's
+                    // neighborhood; skip e to preserve diversity.
+                    keep = false;
+                    break;
+                }
+            }
+            if (keep) chosen.push_back(e);
+            else discarded.push_back(e);
+        }
+        // If we ran out of candidates, top up from discards to maintain M.
+        for (const Cand& e : discarded) {
+            if (static_cast<int>(chosen.size()) >= M) break;
+            chosen.push_back(e);
+        }
+        return chosen;
     }
 
     void connect(Slot src, const std::vector<Cand>& neighbors, int layer,
-                 const void* ctx, DotFn dot_fn) {
+                 const void* ctx, PairDotFn pair_fn) {
         // Add src->n on this layer.
         for (const Cand& nc : neighbors) {
-            insert_neighbor(src, nc.slot, layer, ctx, dot_fn);
-            insert_neighbor(nc.slot, src, layer, ctx, dot_fn);
+            insert_neighbor(src, nc.slot, layer, ctx, pair_fn);
+            insert_neighbor(nc.slot, src, layer, ctx, pair_fn);
         }
     }
 
+    // Heuristic shrink: pick farthest neighbor that fails the diversity test
+    // and replace it with `n`. Falls back to "evict last" if pair_fn missing.
     void insert_neighbor(Slot s, Slot n, int layer,
-                         const void* /*ctx*/, DotFn /*dot_fn*/) {
+                         const void* ctx, PairDotFn pair_fn) {
         if (s == n) return;
-        std::lock_guard<std::mutex> lk(slot_mutex(s));
+        std::lock_guard<std::shared_mutex> lk(slot_mutex(s));
         if (layer == 0) {
             uint8_t deg = layer0_deg_[s].load(std::memory_order_relaxed);
             Slot* arr = layer0_neighbors(s);
@@ -730,9 +797,7 @@ private:
                 layer0_deg_[s].store(static_cast<uint8_t>(deg + 1),
                                      std::memory_order_release);
             } else {
-                // Cap reached — replace the most-recent slot (FIFO-ish).
-                // True heuristic eviction is a follow-up (needs slot->vec access).
-                arr[deg - 1] = n;
+                shrink_layer0(s, n, ctx, pair_fn);
             }
         } else {
             int li = layer - 1;
@@ -747,9 +812,41 @@ private:
             if (static_cast<int>(vec.size()) < M_) {
                 vec.push_back(n);
             } else {
-                vec.back() = n;
+                shrink_upper(s, vec, n, ctx, pair_fn);
             }
         }
+    }
+
+    // Replace one of s's M_max0_ neighbors with n if n is heuristically
+    // closer to s than the chosen replacement. Re-runs Algorithm 4 over
+    // {existing ∪ {n}} and keeps the best M_max0_ for s.
+    void shrink_layer0(Slot s, Slot n, const void* ctx, PairDotFn pair_fn) {
+        Slot* arr = layer0_neighbors(s);
+        if (!pair_fn) {
+            arr[M_max0_ - 1] = n;
+            return;
+        }
+        std::priority_queue<Cand, std::vector<Cand>, CmpFar> cand;
+        for (int i = 0; i < M_max0_; ++i) {
+            cand.push({arr[i], 1.0f - pair_fn(ctx, s, arr[i])});
+        }
+        cand.push({n, 1.0f - pair_fn(ctx, s, n)});
+        auto kept = select_neighbors_heuristic(std::move(cand), M_max0_, ctx, pair_fn);
+        for (size_t i = 0; i < kept.size(); ++i) arr[i] = kept[i].slot;
+        layer0_deg_[s].store(static_cast<uint8_t>(kept.size()),
+                             std::memory_order_release);
+    }
+
+    void shrink_upper(Slot s, std::vector<Slot>& vec, Slot n,
+                      const void* ctx, PairDotFn pair_fn) {
+        if (!pair_fn) { vec.back() = n; return; }
+        std::priority_queue<Cand, std::vector<Cand>, CmpFar> cand;
+        for (Slot e : vec) cand.push({e, 1.0f - pair_fn(ctx, s, e)});
+        cand.push({n, 1.0f - pair_fn(ctx, s, n)});
+        auto kept = select_neighbors_heuristic(std::move(cand), M_, ctx, pair_fn);
+        vec.clear();
+        vec.reserve(kept.size());
+        for (const Cand& c : kept) vec.push_back(c.slot);
     }
 
     struct VisitedTLS {
@@ -767,12 +864,12 @@ private:
     int M_max0_;
     int ef_construction_;
 
-    Slot enterpoint_;
-    int  max_layer_;
+    std::atomic<Slot> enterpoint_;
+    std::atomic<int>  max_layer_;
     std::atomic<size_t> size_;
 
     mutable std::shared_mutex global_mutex_;
-    mutable std::vector<std::mutex> mutex_stripes_;
+    mutable std::vector<std::shared_mutex> mutex_stripes_;
 
     std::vector<Slot> layer0_arena_;          // size = max_elements * M_max0_
     std::vector<std::atomic<uint8_t>> layer0_deg_;
@@ -874,6 +971,10 @@ struct Index::Impl {
         const Impl* self = static_cast<const Impl*>(ctx);
         return self->storage_.dot_with(s, query);
     }
+    static float pair_dot_via_storage(const void* ctx, Slot a, Slot b) {
+        const Impl* self = static_cast<const Impl*>(ctx);
+        return self->storage_.dot_slots(a, b);
+    }
 
     // ------- single-key ops -------
     Status put(Key key, const float* vector, const void* payload, size_t payload_len) {
@@ -945,10 +1046,10 @@ struct Index::Impl {
         for (Slot m : members) {
             const float* src = (m == just_added) ? vec : nullptr;
             if (src) {
-                delta_graph_->add(m, src, this, &Impl::dot_via_storage);
+                delta_graph_->add(m, src, this, &Impl::dot_via_storage, &Impl::pair_dot_via_storage);
             } else {
                 storage_.copy_vector(m, tmp.data());
-                delta_graph_->add(m, tmp.data(), this, &Impl::dot_via_storage);
+                delta_graph_->add(m, tmp.data(), this, &Impl::dot_via_storage, &Impl::pair_dot_via_storage);
             }
         }
         delta_hnsw_active_.store(true, std::memory_order_release);
@@ -1149,15 +1250,66 @@ struct Index::Impl {
             }
         }
 
-        // 2. Build new base HNSW from snapshot. Vectors are already in storage_,
-        //    so dot_fn = storage_.dot_with. Concurrent updates to those slots are
-        //    protected by the seqlock (search will retry on torn reads).
+        // 2. Build new base HNSW from snapshot, parallelized across cores.
+        //    The first add must run alone (publishes enterpoint); the rest
+        //    can proceed in parallel since enterpoint_ / max_layer_ are atomic
+        //    and per-slot mutexes serialize neighbor list writes.
         auto new_base = std::make_unique<HnswGraph>(
             config_.dim, config_.max_elements,
             config_.hnsw_M, config_.hnsw_M_max0, config_.hnsw_ef_construction);
-        for (size_t i = 0; i < snap.size(); ++i) {
-            new_base->add(snap[i].slot, snap_vecs.data() + i * config_.dim,
-                          this, &Impl::dot_via_storage);
+
+        // Resolve thread count: 0=serial, 1=auto, N>1=exact.
+        unsigned threads = 1;
+        if (config_.rebuild_threads == 0) {
+            threads = 1;
+        } else if (config_.rebuild_threads == 1) {
+            threads = std::max(1u, std::thread::hardware_concurrency());
+        } else {
+            threads = static_cast<unsigned>(config_.rebuild_threads);
+        }
+        // Tiny graphs aren't worth parallelizing — fixed startup cost dominates
+        // and recall drop hurts most. Threshold tuned empirically.
+        if (snap.size() < 4096) threads = 1;
+
+        if (threads <= 1) {
+            for (size_t i = 0; i < snap.size(); ++i) {
+                new_base->add(snap[i].slot,
+                              snap_vecs.data() + i * config_.dim,
+                              this, &Impl::dot_via_storage,
+                              &Impl::pair_dot_via_storage);
+            }
+        } else {
+            // Warm up single-threaded so the early graph has real structure
+            // before parallel adds fan out (otherwise they all star-connect
+            // to the entry point, hurting recall).
+            const size_t warmup = std::min<size_t>(
+                snap.size(),
+                static_cast<size_t>(config_.hnsw_M_max0) * 8 + 64);
+            for (size_t i = 0; i < warmup; ++i) {
+                new_base->add(snap[i].slot,
+                              snap_vecs.data() + i * config_.dim,
+                              this, &Impl::dot_via_storage,
+                              &Impl::pair_dot_via_storage);
+            }
+            if (snap.size() > warmup) {
+                size_t n_threads = std::min<size_t>(threads, snap.size() - warmup);
+                std::atomic<size_t> next{warmup};
+                std::vector<std::thread> workers;
+                workers.reserve(n_threads);
+                for (size_t t = 0; t < n_threads; ++t) {
+                    workers.emplace_back([&]() {
+                        for (;;) {
+                            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                            if (i >= snap.size()) break;
+                            new_base->add(snap[i].slot,
+                                          snap_vecs.data() + i * config_.dim,
+                                          this, &Impl::dot_via_storage,
+                                          &Impl::pair_dot_via_storage);
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+            }
         }
 
         // 3. Atomic swap.

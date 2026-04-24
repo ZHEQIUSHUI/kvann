@@ -30,6 +30,7 @@ struct Args {
     std::size_t threads  = 4;
     int         topk     = 10;
     int         ef       = 64;
+    int         rebuild_threads = 1;  // 1=auto
     std::string save_path;
 };
 
@@ -50,6 +51,7 @@ Args parse(int argc, char** argv) {
         else if (match("--threads"))   a.threads  = std::stoul(next("--threads"));
         else if (match("--topk"))      a.topk     = std::stoi(next("--topk"));
         else if (match("--ef"))        a.ef       = std::stoi(next("--ef"));
+        else if (match("--rebuild-threads")) a.rebuild_threads = std::stoi(next("--rebuild-threads"));
         else if (match("--save-path")) a.save_path = next("--save-path");
         else {
             std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
     cfg.dim          = a.dim;
     cfg.max_elements = a.n + 1024;
     cfg.hnsw_ef_search = a.ef;
+    cfg.rebuild_threads = a.rebuild_threads;
     kvann::Index index(cfg);
 
     // -------- put --------
