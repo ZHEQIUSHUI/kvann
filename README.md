@@ -127,10 +127,62 @@ target_link_libraries(my_app PRIVATE kvann::kvann)
 4. **最终排序用统一精确相似度**
 5. **任何 ANN 结构都允许整体丢弃并重建**
 
+## Python 绑定（可选）
+
+```bash
+cmake -S . -B build -DKVANN_BUILD_PYTHON=ON
+cmake --build build --target _kvann -j
+PYTHONPATH=build/python python -c "import kvann; print(kvann.simd_backend())"
+```
+
+```python
+import numpy as np
+import kvann
+
+cfg = kvann.IndexConfig()
+cfg.dim = 128
+cfg.max_elements = 10000
+
+idx = kvann.Index(cfg)
+keys = np.arange(1000, dtype=np.uint64)
+vecs = np.random.randn(1000, 128).astype(np.float32)
+vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+
+idx.put_batch(keys, vecs)
+idx.rebuild()
+
+# Single query
+ks, ss, _ = idx.search(vecs[0], topk=5)
+print(list(zip(ks.tolist(), ss.tolist())))
+
+# Batch
+ks2, ss2 = idx.search_batch(vecs[:64], topk=10)  # shape (64, 10) each
+```
+
+`pybind11` is fetched via CMake `FetchContent`, so the core C++ library
+remains zero-dep — only the bindings target needs network access.
+
+## 持久化
+
+文件格式 v3：分段 + CRC32 + 可选 HNSW 图持久化。冷启动时如果文件中含 HNSW
+section 直接还原图（无需 rebuild），10k 向量加载约 18 ms。
+
+```cpp
+index.save("/data/idx.bin");
+auto loaded = kvann::Index::load("/data/idx.bin");   // throws on bad CRC
+```
+
+## 文档
+
+- [`docs/architecture.md`](docs/architecture.md) — 内部分层、并发模型、文件格式
+- [`examples/`](examples/) — 4 个最小可运行示例（quickstart / payload / persistence / concurrent）
+- [`benchmarks/`](benchmarks/) — `kvann_bench` 负载测试程序
+
 ## 当前限制（Roadmap）
 
-- 邻居选择仅 top-M（HNSW heuristic 多样性裁剪 — 跟 base recall 略有关）
-- HNSW 图持久化为重建（load 后会重新 build base）
-- 跨进程 mmap 加载未做
+- 邻居选择仅 top-M（HNSW heuristic 多样性裁剪 — recall 提升空间 1-2%）
+- 单线程 rebuild add（HNSW 内部已线程安全，加 thread pool 即可）
+- Slot compaction 未做（rebuild 不回收 tombstone slot）
+- mmap 加载未做（始终读入内存）
 - WAL / crash-safe 未做
 - 暂不支持量化 / GPU

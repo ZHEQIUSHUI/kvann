@@ -16,9 +16,10 @@ endif()
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-option(KVANN_BUILD_TESTS    "Build unit tests"       ON)
-option(KVANN_BUILD_EXAMPLES "Build example programs" ON)
-option(KVANN_BUILD_BENCH    "Build micro-benchmarks" OFF)
+option(KVANN_BUILD_TESTS    "Build unit tests"            ON)
+option(KVANN_BUILD_EXAMPLES "Build example programs"      ON)
+option(KVANN_BUILD_BENCH    "Build micro-benchmarks"      OFF)
+option(KVANN_BUILD_PYTHON   "Build Python bindings (pybind11)" OFF)
 option(KVANN_ENABLE_AVX2    "Enable AVX2 (+FMA) on x86_64"            ON)
 option(KVANN_ENABLE_NEON    "Enable NEON on aarch64 (always-on)"      ON)
 option(KVANN_ENABLE_LTO     "Enable link-time optimization in Release" OFF)
@@ -126,6 +127,24 @@ if(KVANN_BUILD_EXAMPLES)
     add_executable(example example.cpp)
     target_link_libraries(example PRIVATE kvann)
     kvann_apply_compile_flags(example)
+
+    add_subdirectory(examples)
+endif()
+
+# ---------------------------------------------------------------------------
+# Benchmarks
+# ---------------------------------------------------------------------------
+if(KVANN_BUILD_BENCH)
+    add_executable(kvann_bench benchmarks/bench_main.cpp)
+    target_link_libraries(kvann_bench PRIVATE kvann)
+    kvann_apply_compile_flags(kvann_bench)
+endif()
+
+# ---------------------------------------------------------------------------
+# Python bindings (opt-in)
+# ---------------------------------------------------------------------------
+if(KVANN_BUILD_PYTHON)
+    add_subdirectory(bindings/python)
 endif()
 
 # ---------------------------------------------------------------------------

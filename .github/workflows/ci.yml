@@ -6,18 +6,242 @@ on:
   pull_request:
     branches: ["main", "master"]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # ==========================================================================
+  # Build + test matrix across OS / compiler / SIMD setting
+  # ==========================================================================
   build-test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / simd=${{ matrix.simd }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            compiler: gcc
+            simd: avx2
+            cmake_extra: -DKVANN_ENABLE_AVX2=ON
+            cc: gcc-11
+            cxx: g++-11
+          - os: ubuntu-22.04
+            compiler: clang
+            simd: avx2
+            cmake_extra: -DKVANN_ENABLE_AVX2=ON
+            cc: clang-15
+            cxx: clang++-15
+          - os: ubuntu-22.04
+            compiler: gcc
+            simd: scalar
+            cmake_extra: -DKVANN_ENABLE_AVX2=OFF
+            cc: gcc-11
+            cxx: g++-11
+          - os: macos-14
+            compiler: appleclang
+            simd: neon
+            cmake_extra: ""
+            cc: clang
+            cxx: clang++
+          - os: windows-2022
+            compiler: msvc
+            simd: avx2
+            cmake_extra: -DKVANN_ENABLE_AVX2=ON
+            cc: ""
+            cxx: ""
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Set compiler env (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          echo "CC=${{ matrix.cc }}"   >> "$GITHUB_ENV"
+          echo "CXX=${{ matrix.cxx }}" >> "$GITHUB_ENV"
+
+      - name: Install clang-15 (Linux clang job)
+        if: matrix.compiler == 'clang' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-15
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DKVANN_BUILD_TESTS=ON
+          -DKVANN_BUILD_EXAMPLES=ON
+          -DKVANN_BUILD_BENCH=ON
+          ${{ matrix.cmake_extra }}
+
+      - name: Build
+        run: cmake --build build --config Release -j 2
+
+      - name: Test
+        working-directory: build
+        run: ctest -C Release --output-on-failure
+
+      - name: Smoke benchmark
+        working-directory: build
+        shell: bash
+        run: |
+          ./kvann_bench --n 5000 --queries 100 --threads 2 \
+                        --save-path bench.idx > bench.csv
+          cat bench.csv
+
+      - name: Upload bench output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.simd }}
+          path: build/bench.csv
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # Cross-compile aarch64 + run tests under qemu-user
+  # ==========================================================================
+  cross-aarch64:
+    name: cross-aarch64 / NEON
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 toolchain + qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-aarch64-linux-gnu qemu-user-static
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DKVANN_BUILD_TESTS=ON \
+            -DKVANN_BUILD_BENCH=ON
+
+      - name: Build
+        run: cmake --build build-arm64 -j 2
+
+      - name: Run tests under qemu
+        working-directory: build-arm64
+        run: |
+          export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+          for t in test_v1 test_user_data test_opt; do
+            echo "==== $t ===="
+            qemu-aarch64-static ./$t
+          done
+
+      - name: Smoke benchmark under qemu
+        working-directory: build-arm64
+        run: |
+          export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+          qemu-aarch64-static ./kvann_bench --n 2000 --queries 50 --threads 2
+
+  # ==========================================================================
+  # Sanitizers — Linux x86_64
+  # ==========================================================================
+  sanitizers:
+    name: sanitizer / ${{ matrix.san }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - san: asan-ubsan
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          - san: tsan
+            flags: "-fsanitize=thread -fno-omit-frame-pointer -g"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        env:
+          CXXFLAGS: "${{ matrix.flags }}"
+          LDFLAGS:  "${{ matrix.flags }}"
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DKVANN_BUILD_TESTS=ON
+          -DKVANN_ENABLE_AVX2=ON
 
       - name: Build
         run: cmake --build build -j 2
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        working-directory: build
+        env:
+          ASAN_OPTIONS:  "detect_leaks=1:abort_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+          TSAN_OPTIONS:  "halt_on_error=1:second_deadlock_stack=1"
+        run: ctest --output-on-failure
+
+  # ==========================================================================
+  # Python bindings (Linux only)
+  # ==========================================================================
+  python-bindings:
+    name: python bindings
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install numpy
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DKVANN_BUILD_TESTS=OFF
+          -DKVANN_BUILD_EXAMPLES=OFF
+          -DKVANN_BUILD_PYTHON=ON
+          -DKVANN_ENABLE_AVX2=ON
+
+      - name: Build
+        run: cmake --build build --target _kvann -j 2
+
+      - name: Run smoke test
+        env:
+          PYTHONPATH: build/python
+        run: python bindings/python/test_kvann.py
+
+  # ==========================================================================
+  # Larger benchmark — informational, surfaces perf as artifact
+  # ==========================================================================
+  bench-large:
+    name: bench (n=20000)
+    runs-on: ubuntu-22.04
+    needs: build-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DKVANN_BUILD_TESTS=OFF
+          -DKVANN_BUILD_BENCH=ON
+          -DKVANN_ENABLE_AVX2=ON
+
+      - name: Build
+        run: cmake --build build --target kvann_bench -j 2
+
+      - name: Run
+        working-directory: build
+        run: |
+          ./kvann_bench --n 20000 --queries 500 --threads 4 \
+                        --save-path bench.idx > bench-large.csv
+          cat bench-large.csv
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-large-x86_64-avx2
+          path: build/bench-large.csv

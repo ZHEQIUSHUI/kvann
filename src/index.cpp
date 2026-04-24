@@ -23,6 +23,7 @@
 #include <kvann/status.h>
 #include <kvann/detail/alloc.h>
 #include <kvann/detail/arch.h>
+#include <kvann/detail/crc32.h>
 #include <kvann/detail/log.h>
 #include <kvann/detail/simd.h>
 
@@ -423,20 +424,117 @@ public:
         return out;
     }
 
-    // Persist neighbors only (vectors are stored elsewhere).
-    void save_meta(std::ofstream& out) const {
+    // ---- Persistence ----
+    // Full graph state -> stream. Vectors are stored elsewhere.
+    // Format:
+    //   u32 enterpoint, i32 max_layer, u64 size
+    //   u64 n_nodes  (slots with top >= 0)
+    //   for each node:
+    //     u32 slot
+    //     i8  top_layer
+    //     u8  layer0_deg
+    //     Slot[layer0_deg] layer0_neighbors
+    //     for layer in 1..top:
+    //       u8 deg
+    //       Slot[deg] neighbors
+    void save_graph(std::vector<uint8_t>& out) const {
         std::shared_lock lk(global_mutex_);
-        out.write(reinterpret_cast<const char*>(&enterpoint_), sizeof(enterpoint_));
-        out.write(reinterpret_cast<const char*>(&max_layer_), sizeof(max_layer_));
-        out.write(reinterpret_cast<const char*>(&max_elements_), sizeof(max_elements_));
-        out.write(reinterpret_cast<const char*>(&M_), sizeof(M_));
-        out.write(reinterpret_cast<const char*>(&M_max0_), sizeof(M_max0_));
-        out.write(reinterpret_cast<const char*>(&ef_construction_), sizeof(ef_construction_));
-        size_t sz = size_.load(std::memory_order_acquire);
-        out.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+        auto put = [&](const void* p, std::size_t n) {
+            const uint8_t* b = static_cast<const uint8_t*>(p);
+            out.insert(out.end(), b, b + n);
+        };
+
+        uint32_t ep = enterpoint_;
+        int32_t  ml = max_layer_;
+        uint64_t sz = size_.load(std::memory_order_acquire);
+        put(&ep, sizeof(ep));
+        put(&ml, sizeof(ml));
+        put(&sz, sizeof(sz));
+
+        // Count nodes and remember which to dump.
+        uint64_t n_nodes = 0;
+        for (size_t i = 0; i < node_top_.size(); ++i) {
+            if (node_top_[i].load(std::memory_order_acquire) >= 0) ++n_nodes;
+        }
+        put(&n_nodes, sizeof(n_nodes));
+
+        for (size_t i = 0; i < node_top_.size(); ++i) {
+            int8_t top = node_top_[i].load(std::memory_order_acquire);
+            if (top < 0) continue;
+
+            uint32_t s = static_cast<uint32_t>(i);
+            put(&s, sizeof(s));
+            put(&top, sizeof(top));
+
+            uint8_t deg0 = layer0_deg_[i].load(std::memory_order_acquire);
+            put(&deg0, sizeof(deg0));
+            const Slot* nbrs = layer0_neighbors(static_cast<Slot>(i));
+            put(nbrs, sizeof(Slot) * deg0);
+
+            const auto& upper = upper_[i];
+            for (int L = 1; L <= top; ++L) {
+                int li = L - 1;
+                uint8_t deg = (li < static_cast<int>(upper.size()))
+                              ? static_cast<uint8_t>(upper[li].size()) : 0;
+                put(&deg, sizeof(deg));
+                if (deg > 0) put(upper[li].data(), sizeof(Slot) * deg);
+            }
+        }
     }
 
-    // (Persistence of full graph is M5; for now we rebuild on load.)
+    void load_graph(const uint8_t* data, std::size_t len) {
+        std::unique_lock lk(global_mutex_);
+        std::size_t off = 0;
+        auto take = [&](void* dst, std::size_t n) {
+            if (off + n > len) throw std::runtime_error("hnsw graph: short read");
+            std::memcpy(dst, data + off, n);
+            off += n;
+        };
+
+        // Reset
+        for (auto& d : layer0_deg_) d.store(0, std::memory_order_relaxed);
+        for (auto& t : node_top_) t.store(-1, std::memory_order_relaxed);
+        for (auto& u : upper_) u.clear();
+
+        uint32_t ep;
+        int32_t ml;
+        uint64_t sz, n_nodes;
+        take(&ep, sizeof(ep));
+        take(&ml, sizeof(ml));
+        take(&sz, sizeof(sz));
+        take(&n_nodes, sizeof(n_nodes));
+        enterpoint_ = ep;
+        max_layer_  = ml;
+        size_.store(sz, std::memory_order_release);
+
+        for (uint64_t i = 0; i < n_nodes; ++i) {
+            uint32_t s;
+            int8_t top;
+            take(&s, sizeof(s));
+            take(&top, sizeof(top));
+            if (s >= max_elements_) throw std::runtime_error("hnsw: slot out of range");
+            node_top_[s].store(top, std::memory_order_release);
+
+            uint8_t deg0;
+            take(&deg0, sizeof(deg0));
+            if (deg0 > M_max0_) throw std::runtime_error("hnsw: deg0 out of range");
+            Slot* nbrs = layer0_neighbors(static_cast<Slot>(s));
+            take(nbrs, sizeof(Slot) * deg0);
+            layer0_deg_[s].store(deg0, std::memory_order_release);
+
+            if (top > 0) {
+                upper_[s].resize(static_cast<std::size_t>(top));
+                for (int L = 1; L <= top; ++L) {
+                    int li = L - 1;
+                    uint8_t deg;
+                    take(&deg, sizeof(deg));
+                    upper_[s][li].resize(deg);
+                    if (deg > 0) take(upper_[s][li].data(), sizeof(Slot) * deg);
+                }
+            }
+        }
+        if (off != len) throw std::runtime_error("hnsw: trailing bytes");
+    }
 
     void clear() {
         std::unique_lock lk(global_mutex_);
@@ -1077,46 +1175,158 @@ struct Index::Impl {
 
     const IndexConfig& config() const { return config_; }
 
-    // ------- persistence -------
+    // ------- persistence (file format v3) -------
+    //
+    // Layout:
+    //   [0..32)        Header (magic, fmt_version, flags, num_sections)
+    //   [32..288)      Section table: 8 entries x 32 bytes (zero-padded)
+    //   [288..)        Sections in order: meta, keys, vectors, [hnsw_graph]
+    //
+    // Section IDs:
+    //   1 META, 2 KEYS, 3 VECTORS, 4 HNSW_GRAPH (optional)
+    //
+    // Each section is checksummed with CRC32 (IEEE 802.3, reflected).
     Status save(const std::string& path) const {
+        constexpr uint32_t kFmtVersion   = 3;
+        constexpr uint32_t kSecMeta      = 1;
+        constexpr uint32_t kSecKeys      = 2;
+        constexpr uint32_t kSecVectors   = 3;
+        constexpr uint32_t kSecHnswGraph = 4;
+        constexpr size_t   kHeaderSize   = 32;
+        constexpr size_t   kMaxSections  = 8;
+        constexpr size_t   kTableSize    = kMaxSections * 32;
+        constexpr size_t   kPrefix       = kHeaderSize + kTableSize;
+
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) return Status::Io("cannot open: " + path);
 
-        const char magic[8] = {'K','V','A','N','N','0','2','\0'};
-        uint32_t fmt_version = 2;
-        uint32_t reserved = 0;
-        out.write(magic, sizeof(magic));
-        out.write(reinterpret_cast<const char*>(&fmt_version), sizeof(fmt_version));
-        out.write(reinterpret_cast<const char*>(&reserved), sizeof(reserved));
+        // Reserve prefix.
+        std::vector<char> zeros(kPrefix, 0);
+        out.write(zeros.data(), zeros.size());
 
-        // Config
-        out.write(reinterpret_cast<const char*>(&config_.dim), sizeof(size_t));
-        out.write(reinterpret_cast<const char*>(&config_.max_elements), sizeof(size_t));
-        out.write(reinterpret_cast<const char*>(&config_.storage_block_size), sizeof(size_t));
+        struct SecEntry {
+            uint32_t id; uint32_t pad0;
+            uint64_t offset; uint64_t length;
+            uint32_t crc; uint32_t pad1;
+        };
+        std::vector<SecEntry> sections;
 
-        // Snapshot live keys + payloads + vectors (slot order).
+        auto write_section = [&](uint32_t id, const std::vector<uint8_t>& bytes) {
+            SecEntry e{};
+            e.id     = id;
+            e.offset = static_cast<uint64_t>(out.tellp());
+            e.length = bytes.size();
+            e.crc    = detail::crc32(bytes.data(), bytes.size());
+            out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            sections.push_back(e);
+        };
+
+        // ---- META section ----
+        {
+            std::vector<uint8_t> buf;
+            auto put = [&](const void* p, size_t n) {
+                const uint8_t* b = static_cast<const uint8_t*>(p);
+                buf.insert(buf.end(), b, b + n);
+            };
+            uint64_t dim = config_.dim;
+            uint64_t maxe = config_.max_elements;
+            uint64_t blk = config_.storage_block_size;
+            uint64_t ns = next_slot_.load(std::memory_order_acquire);
+            int32_t M = config_.hnsw_M, M0 = config_.hnsw_M_max0,
+                    efc = config_.hnsw_ef_construction;
+            put(&dim, 8); put(&maxe, 8); put(&blk, 8); put(&ns, 8);
+            put(&M, 4); put(&M0, 4); put(&efc, 4);
+            uint32_t pad = 0; put(&pad, 4);
+            write_section(kSecMeta, buf);
+        }
+
+        // Snapshot live keys, sorted by slot.
         auto entries = key_dir_.snapshot_all();
         std::sort(entries.begin(), entries.end(),
                   [](const auto& a, const auto& b) { return a.second.slot < b.second.slot; });
 
-        size_t n = entries.size();
-        out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-
-        std::vector<Slot> slots;
-        slots.reserve(n);
-        for (auto& [k, e] : entries) {
-            out.write(reinterpret_cast<const char*>(&k), sizeof(k));
-            out.write(reinterpret_cast<const char*>(&e.slot), sizeof(e.slot));
-            out.write(reinterpret_cast<const char*>(&e.version), sizeof(e.version));
-            size_t pl = e.payload.size();
-            out.write(reinterpret_cast<const char*>(&pl), sizeof(pl));
-            if (pl > 0) {
-                out.write(reinterpret_cast<const char*>(e.payload.data()), pl);
+        // ---- KEYS section ----
+        {
+            std::vector<uint8_t> buf;
+            auto put = [&](const void* p, size_t n) {
+                const uint8_t* b = static_cast<const uint8_t*>(p);
+                buf.insert(buf.end(), b, b + n);
+            };
+            uint64_t n = entries.size();
+            put(&n, 8);
+            for (auto& [k, e] : entries) {
+                put(&k, 8);
+                put(&e.slot, 4);
+                uint64_t ver = e.version;
+                put(&ver, 8);
+                uint64_t pl = e.payload.size();
+                put(&pl, 8);
+                if (pl > 0) put(e.payload.data(), pl);
             }
-            slots.push_back(e.slot);
+            write_section(kSecKeys, buf);
         }
 
-        storage_.save_vectors(out, slots);
+        // ---- VECTORS section (streamed, large) ----
+        {
+            SecEntry e{};
+            e.id = kSecVectors;
+            e.offset = static_cast<uint64_t>(out.tellp());
+            uint32_t crc = 0;
+
+            uint64_t dim = config_.dim;
+            uint64_t n = entries.size();
+            out.write(reinterpret_cast<const char*>(&dim), 8);
+            crc = detail::crc32_update(crc, &dim, 8);
+            out.write(reinterpret_cast<const char*>(&n), 8);
+            crc = detail::crc32_update(crc, &n, 8);
+
+            std::vector<float> tmp(config_.dim);
+            for (auto& [k, en] : entries) {
+                storage_.copy_vector(en.slot, tmp.data());
+                size_t b = config_.dim * sizeof(float);
+                out.write(reinterpret_cast<const char*>(tmp.data()), b);
+                crc = detail::crc32_update(crc, tmp.data(), b);
+            }
+            e.length = static_cast<uint64_t>(out.tellp()) - e.offset;
+            e.crc = crc;
+            sections.push_back(e);
+        }
+
+        // ---- HNSW_GRAPH section (only if base is non-empty) ----
+        bool has_hnsw = false;
+        {
+            std::shared_lock lk(base_swap_mutex_);
+            if (!base_graph_->empty()) {
+                has_hnsw = true;
+                std::vector<uint8_t> buf;
+                base_graph_->save_graph(buf);
+                write_section(kSecHnswGraph, buf);
+            }
+        }
+
+        // Seek back, write header + section table.
+        out.seekp(0, std::ios::beg);
+        char magic[8] = {'K','V','A','N','N','0','3','\0'};
+        uint32_t flags = has_hnsw ? 1u : 0u;
+        uint32_t num_sections = static_cast<uint32_t>(sections.size());
+        uint32_t reserved = 0;
+        uint64_t reserved2 = 0;
+        out.write(magic, 8);
+        out.write(reinterpret_cast<const char*>(&kFmtVersion), 4);
+        out.write(reinterpret_cast<const char*>(&flags), 4);
+        out.write(reinterpret_cast<const char*>(&num_sections), 4);
+        out.write(reinterpret_cast<const char*>(&reserved), 4);
+        out.write(reinterpret_cast<const char*>(&reserved2), 8);
+
+        for (const auto& s : sections) {
+            out.write(reinterpret_cast<const char*>(&s), sizeof(SecEntry));
+        }
+        // pad table to fixed size
+        for (size_t i = sections.size(); i < kMaxSections; ++i) {
+            char zero[32] = {};
+            out.write(zero, 32);
+        }
+
         out.flush();
         if (!out) return Status::Io("write failed");
         return Status::Ok();
@@ -1124,30 +1334,86 @@ struct Index::Impl {
 
     static std::unique_ptr<Index> load(const std::string& path);
 
+    // Loads sections from an open input stream positioned at byte 0.
+    // Returns false on any error (status set by caller).
     void load_from_stream(std::ifstream& in) {
-        size_t n;
-        in.read(reinterpret_cast<char*>(&n), sizeof(n));
+        constexpr size_t kMaxSections = 8;
 
+        char magic[8] = {};
+        in.read(magic, 8);
+        static const char expected[8] = {'K','V','A','N','N','0','3','\0'};
+        if (std::memcmp(magic, expected, 8) != 0) {
+            throw std::runtime_error("kvann: bad magic (need v3)");
+        }
+        uint32_t fmt_version = 0, flags = 0, num_sections = 0, reserved = 0;
+        uint64_t reserved2 = 0;
+        in.read(reinterpret_cast<char*>(&fmt_version), 4);
+        in.read(reinterpret_cast<char*>(&flags), 4);
+        in.read(reinterpret_cast<char*>(&num_sections), 4);
+        in.read(reinterpret_cast<char*>(&reserved), 4);
+        in.read(reinterpret_cast<char*>(&reserved2), 8);
+        if (fmt_version != 3) {
+            throw std::runtime_error("kvann: unsupported fmt_version");
+        }
+
+        struct SecEntry {
+            uint32_t id; uint32_t pad0;
+            uint64_t offset; uint64_t length;
+            uint32_t crc; uint32_t pad1;
+        };
+        std::vector<SecEntry> table(kMaxSections);
+        in.read(reinterpret_cast<char*>(table.data()), kMaxSections * 32);
+        table.resize(num_sections);
+
+        auto find_section = [&](uint32_t id) -> const SecEntry* {
+            for (auto& e : table) if (e.id == id) return &e;
+            return nullptr;
+        };
+
+        auto read_section = [&](const SecEntry& e) -> std::vector<uint8_t> {
+            std::vector<uint8_t> buf(e.length);
+            in.seekg(static_cast<std::streamoff>(e.offset), std::ios::beg);
+            in.read(reinterpret_cast<char*>(buf.data()), e.length);
+            uint32_t got = detail::crc32(buf.data(), buf.size());
+            if (got != e.crc) {
+                throw std::runtime_error("kvann: section CRC mismatch (id=" +
+                                         std::to_string(e.id) + ")");
+            }
+            return buf;
+        };
+
+        // KEYS
+        const SecEntry* sk = find_section(2);
+        if (!sk) throw std::runtime_error("kvann: missing KEYS section");
+        auto kbuf = read_section(*sk);
+
+        // Parse keys
+        size_t off = 0;
+        auto take = [&](void* dst, size_t n) {
+            if (off + n > kbuf.size()) throw std::runtime_error("KEYS short");
+            std::memcpy(dst, kbuf.data() + off, n);
+            off += n;
+        };
+        uint64_t n_keys = 0;
+        take(&n_keys, 8);
         std::vector<Slot> slots;
-        slots.reserve(n);
+        slots.reserve(n_keys);
         Slot max_slot = 0;
-
-        for (size_t i = 0; i < n; ++i) {
-            Key k;
+        for (uint64_t i = 0; i < n_keys; ++i) {
+            Key k = 0;
+            Slot slot = 0;
+            uint64_t ver = 0, pl = 0;
+            take(&k, 8); take(&slot, 4); take(&ver, 8); take(&pl, 8);
             KeyEntry e;
-            in.read(reinterpret_cast<char*>(&k), sizeof(k));
-            in.read(reinterpret_cast<char*>(&e.slot), sizeof(e.slot));
-            in.read(reinterpret_cast<char*>(&e.version), sizeof(e.version));
-            size_t pl;
-            in.read(reinterpret_cast<char*>(&pl), sizeof(pl));
+            e.slot = slot;
+            e.version = ver;
             if (pl > 0) {
                 e.payload.resize(pl);
-                in.read(reinterpret_cast<char*>(e.payload.data()), pl);
+                take(e.payload.data(), pl);
             }
-            Slot slot = e.slot;
             slot_key_.set(slot, k);
             if (slot + 1 > max_slot) max_slot = slot + 1;
-            key_dir_.with_write(k, [&](KeyEntry& slot_entry, bool /*inserted*/) {
+            key_dir_.with_write(k, [&](KeyEntry& slot_entry, bool) {
                 slot_entry = std::move(e);
             });
             slots.push_back(slot);
@@ -1155,10 +1421,40 @@ struct Index::Impl {
         next_slot_.store(max_slot, std::memory_order_release);
         live_count_.store(slots.size(), std::memory_order_release);
 
-        storage_.load_vectors(in, slots);
+        // VECTORS
+        const SecEntry* sv = find_section(3);
+        if (!sv) throw std::runtime_error("kvann: missing VECTORS section");
+        auto vbuf = read_section(*sv);
+        size_t voff = 0;
+        auto vtake = [&](void* dst, size_t n) {
+            if (voff + n > vbuf.size()) throw std::runtime_error("VECTORS short");
+            std::memcpy(dst, vbuf.data() + voff, n);
+            voff += n;
+        };
+        uint64_t vdim = 0, vn = 0;
+        vtake(&vdim, 8); vtake(&vn, 8);
+        if (vdim != config_.dim || vn != slots.size()) {
+            throw std::runtime_error("kvann: vectors header mismatch");
+        }
+        for (uint64_t i = 0; i < vn; ++i) {
+            const float* src = reinterpret_cast<const float*>(vbuf.data() + voff);
+            voff += config_.dim * sizeof(float);
+            storage_.set_vector(slots[i], src);
+        }
 
-        // Rebuild base HNSW from the freshly loaded KV.
-        rebuild();
+        // HNSW_GRAPH (optional)
+        if (flags & 1u) {
+            const SecEntry* sh = find_section(4);
+            if (sh) {
+                auto hbuf = read_section(*sh);
+                base_graph_->load_graph(hbuf.data(), hbuf.size());
+            }
+        }
+
+        // If no HNSW graph in file, rebuild from KV.
+        if ((flags & 1u) == 0) {
+            rebuild();
+        }
     }
 
     IndexConfig config_;
@@ -1224,26 +1520,68 @@ std::unique_ptr<Index> Index::load(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open: " + path);
 
+    // Read header magic to verify before constructing.
     char magic[8] = {};
-    in.read(magic, sizeof(magic));
-    static const char expected[8] = {'K','V','A','N','N','0','2','\0'};
-    if (std::memcmp(magic, expected, sizeof(magic)) != 0) {
-        throw std::runtime_error("kvann: unsupported file format (need v2)");
+    in.read(magic, 8);
+    static const char expected[8] = {'K','V','A','N','N','0','3','\0'};
+    if (std::memcmp(magic, expected, 8) != 0) {
+        throw std::runtime_error("kvann: bad magic (need v3)");
     }
-    uint32_t fmt_version = 0;
-    uint32_t reserved = 0;
-    in.read(reinterpret_cast<char*>(&fmt_version), sizeof(fmt_version));
-    in.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
-    if (fmt_version != 2) {
-        throw std::runtime_error("kvann: unsupported format version");
+
+    // Skip rest of header to reach section table, then read META.
+    uint32_t fmt_version = 0, flags = 0, num_sections = 0, reserved = 0;
+    uint64_t reserved2 = 0;
+    in.read(reinterpret_cast<char*>(&fmt_version), 4);
+    in.read(reinterpret_cast<char*>(&flags), 4);
+    in.read(reinterpret_cast<char*>(&num_sections), 4);
+    in.read(reinterpret_cast<char*>(&reserved), 4);
+    in.read(reinterpret_cast<char*>(&reserved2), 8);
+    if (fmt_version != 3) {
+        throw std::runtime_error("kvann: unsupported fmt_version");
+    }
+
+    struct SecEntry {
+        uint32_t id; uint32_t pad0;
+        uint64_t offset; uint64_t length;
+        uint32_t crc; uint32_t pad1;
+    };
+    std::vector<SecEntry> table(8);
+    in.read(reinterpret_cast<char*>(table.data()), 8 * 32);
+    table.resize(num_sections);
+
+    // Find META, parse minimal fields needed for IndexConfig.
+    const SecEntry* sm = nullptr;
+    for (auto& e : table) if (e.id == 1) { sm = &e; break; }
+    if (!sm) throw std::runtime_error("kvann: missing META section");
+
+    std::vector<uint8_t> mbuf(sm->length);
+    in.seekg(static_cast<std::streamoff>(sm->offset), std::ios::beg);
+    in.read(reinterpret_cast<char*>(mbuf.data()), sm->length);
+
+    if (detail::crc32(mbuf.data(), mbuf.size()) != sm->crc) {
+        throw std::runtime_error("kvann: META CRC mismatch");
     }
 
     IndexConfig cfg;
-    in.read(reinterpret_cast<char*>(&cfg.dim), sizeof(size_t));
-    in.read(reinterpret_cast<char*>(&cfg.max_elements), sizeof(size_t));
-    in.read(reinterpret_cast<char*>(&cfg.storage_block_size), sizeof(size_t));
+    size_t off = 0;
+    auto take = [&](void* dst, size_t n) {
+        std::memcpy(dst, mbuf.data() + off, n);
+        off += n;
+    };
+    uint64_t dim, maxe, blk, ns;
+    int32_t M, M0, efc;
+    take(&dim, 8); take(&maxe, 8); take(&blk, 8); take(&ns, 8);
+    take(&M, 4); take(&M0, 4); take(&efc, 4);
+    cfg.dim                  = static_cast<size_t>(dim);
+    cfg.max_elements         = static_cast<size_t>(maxe);
+    cfg.storage_block_size   = static_cast<size_t>(blk);
+    cfg.hnsw_M               = M;
+    cfg.hnsw_M_max0          = M0;
+    cfg.hnsw_ef_construction = efc;
 
     auto idx = std::make_unique<Index>(cfg);
+    in.clear();
+    in.seekg(0, std::ios::beg);
     idx->impl_->load_from_stream(in);
     return idx;
 }
