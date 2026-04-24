@@ -106,16 +106,23 @@ kvann_apply_compile_flags(kvann)
 if(KVANN_BUILD_TESTS)
     enable_testing()
 
-    foreach(_t test_v1 test_user_data test_opt)
-        if(_t STREQUAL "test_v1")
-            add_executable(${_t} tests/test_v1.cpp)
-        elseif(_t STREQUAL "test_user_data")
-            add_executable(${_t} tests/test_user_data.cpp)
-        else()
-            add_executable(${_t} tests/test_opt.cpp)
-        endif()
+    set(_kvann_tests
+        test_v1
+        test_user_data
+        test_opt
+        test_edge
+        test_stress
+        test_persistence_corruption
+        test_property
+    )
+    foreach(_t IN LISTS _kvann_tests)
+        add_executable(${_t} tests/${_t}.cpp)
         target_link_libraries(${_t} PRIVATE kvann)
         kvann_apply_compile_flags(${_t})
+        # backtraces in tests
+        if(NOT MSVC)
+            target_link_options(${_t} PRIVATE -rdynamic)
+        endif()
         add_test(NAME ${_t} COMMAND ${_t})
     endforeach()
 endif()

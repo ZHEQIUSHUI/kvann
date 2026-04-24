@@ -29,10 +29,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -71,7 +73,8 @@ public:
           dim_padded_(round_up(dim, 8)),  // 32-byte / 8-float alignment for AVX
           block_size_(block_size ? block_size : 4096),
           max_elements_(max_elements),
-          version_(max_elements) {
+          version_(max_elements),
+          slot_mutexes_(kSlotMutexN) {
         // Pre-allocate enough blocks to cover max_elements lazily on demand.
         size_t needed = (max_elements_ + block_size_ - 1) / block_size_;
         blocks_.reserve(needed);
@@ -90,11 +93,15 @@ public:
 
     void set_vector(Slot slot, const float* src) {
         ensure_block(slot);
+        // Serialize concurrent writers to the same slot so the seqlock window
+        // (odd version + memcpy + even version) is atomic per writer. Without
+        // this, two put()s targeting the same key would have overlapping
+        // memcpys and a torn version sequence.
+        std::lock_guard<std::mutex> lk(slot_mutexes_[slot & (kSlotMutexN - 1)]);
         auto& v = version_[slot];
         v.fetch_add(1, std::memory_order_acq_rel);  // -> odd (writing)
         float* dst = slot_ptr(slot);
         std::memcpy(dst, src, dim_ * sizeof(float));
-        // pad bytes don't need init for dot; we sized arena to dim_padded_.
         v.fetch_add(1, std::memory_order_release);  // -> even (stable)
     }
 
@@ -181,6 +188,8 @@ private:
         return blocks_[slot / block_size_] + (slot % block_size_) * dim_padded_;
     }
 
+    static constexpr size_t kSlotMutexN = 1024;
+
     size_t dim_;
     size_t dim_padded_;
     size_t block_size_;
@@ -188,6 +197,7 @@ private:
     std::vector<float*> blocks_;
     mutable std::mutex grow_mutex_;
     mutable std::vector<std::atomic<uint32_t>> version_;
+    mutable std::vector<std::mutex> slot_mutexes_;
 };
 
 // ============================================================================
@@ -394,12 +404,17 @@ public:
 
     std::vector<SearchHit> search(const float* query, int ef, int /*topk*/,
                                   const void* ctx, DotFn dot_fn) const {
-        if (empty()) return {};
-
         Slot ep;
         int top;
         {
+            // Re-check empty() inside the lock so a concurrent clear()/swap
+            // between the user's empty() check and our read of enterpoint_
+            // can't hand us an invalid slot.
             std::shared_lock lk(global_mutex_);
+            if (size_.load(std::memory_order_relaxed) == 0 ||
+                enterpoint_ == kInvalidSlot) {
+                return {};
+            }
             ep = enterpoint_;
             top = max_layer_;
         }
@@ -838,8 +853,7 @@ struct Index::Impl {
               config_.dim, config_.max_elements,
               config_.hnsw_M, config_.hnsw_M_max0, config_.hnsw_ef_construction)),
           delta_(config_.max_elements),
-          next_slot_(0),
-          rebuild_running_(false) {
+          next_slot_(0) {
         if (config_.dim == 0) {
             throw std::invalid_argument("kvann: IndexConfig::dim must be > 0");
         }
@@ -850,7 +864,9 @@ struct Index::Impl {
     }
 
     ~Impl() {
-        if (rebuild_thread_.joinable()) rebuild_thread_.join();
+        // Wait for any in-flight rebuild before destruction so the detached
+        // worker thread doesn't outlive `this`.
+        wait_rebuild();
     }
 
     // ------- ctx adapter for HnswGraph -------
@@ -1074,13 +1090,24 @@ struct Index::Impl {
     }
 
     // ------- rebuild -------
+    //
+    // We use a shared_future so multiple threads can safely wait for the same
+    // rebuild without racing on std::thread::join (which is UB if called from
+    // multiple threads). Worker is detached and signals completion via a
+    // promise; the destructor waits for any in-flight rebuild.
     Status rebuild_async() {
-        bool expected = false;
-        if (!rebuild_running_.compare_exchange_strong(expected, true)) {
+        std::lock_guard<std::mutex> lk(rebuild_mu_);
+        if (rebuild_future_.valid() &&
+            rebuild_future_.wait_for(std::chrono::seconds(0))
+                != std::future_status::ready) {
             return Status::AlreadyExists("rebuild already running");
         }
-        if (rebuild_thread_.joinable()) rebuild_thread_.join();
-        rebuild_thread_ = std::thread([this]() { do_rebuild(); });
+        auto pr = std::make_shared<std::promise<void>>();
+        rebuild_future_ = pr->get_future().share();
+        std::thread([this, pr]() {
+            try { do_rebuild(); } catch (...) {}
+            pr->set_value();
+        }).detach();
         return Status::Ok();
     }
 
@@ -1092,14 +1119,19 @@ struct Index::Impl {
     }
 
     void wait_rebuild() const {
-        if (rebuild_thread_.joinable()) {
-            const_cast<std::thread&>(rebuild_thread_).join();
+        std::shared_future<void> f;
+        {
+            std::lock_guard<std::mutex> lk(rebuild_mu_);
+            f = rebuild_future_;
         }
+        if (f.valid()) f.wait();
     }
 
     void do_rebuild() {
         emit_log(config_, "info", "rebuild starting");
         KVANN_LOG_INFO("rebuild starting");
+        // No need for rebuild_running_ flag; rebuild_future_ ready state is
+        // the source of truth (checked under rebuild_mu_).
 
         // 1. Snapshot live (key, slot, vector) under stripe read locks.
         struct Snap { Key key; Slot slot; };
@@ -1148,7 +1180,6 @@ struct Index::Impl {
             delta_hnsw_active_.store(false, std::memory_order_release);
         }
 
-        rebuild_running_.store(false, std::memory_order_release);
         emit_log(config_, "info", "rebuild done");
         KVANN_LOG_INFO("rebuild done");
     }
@@ -1469,8 +1500,8 @@ struct Index::Impl {
     std::mutex          delta_hnsw_build_mutex_;
 
     std::atomic<Slot> next_slot_;
-    std::atomic<bool> rebuild_running_;
-    std::thread       rebuild_thread_;
+    mutable std::mutex          rebuild_mu_;
+    mutable std::shared_future<void> rebuild_future_;
     mutable std::shared_mutex base_swap_mutex_;
 };
 
