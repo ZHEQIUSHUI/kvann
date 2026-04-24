@@ -1,35 +1,25 @@
 #include <kvann/core.h>
+#include <kvann/detail/simd.h>
+
 #include <cmath>
 
 namespace kvann {
 
-float cosine_similarity(const float* a, const float* b, size_t dim) {
-    float dot = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        dot += a[i] * b[i];
-    }
-    return dot;
+float cosine_similarity(const float* a, const float* b, std::size_t dim) {
+    return simd::dot_f32(a, b, dim);
 }
 
-void normalize_vector(float* vec, size_t dim) {
-    float norm = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        norm += vec[i] * vec[i];
-    }
-    norm = std::sqrt(norm);
-    if (norm > 0.0f) {
-        for (size_t i = 0; i < dim; ++i) {
-            vec[i] /= norm;
-        }
-    }
+void normalize_vector(float* vec, std::size_t dim) {
+    simd::normalize_f32(vec, dim);
 }
 
-bool is_normalized(const float* vec, size_t dim, float eps) {
-    float norm = 0.0f;
-    for (size_t i = 0; i < dim; ++i) {
-        norm += vec[i] * vec[i];
-    }
-    return std::abs(norm - 1.0f) < eps;
+bool is_normalized(const float* vec, std::size_t dim, float eps) {
+    float nrm2 = simd::dot_f32(vec, vec, dim);
+    return std::fabs(nrm2 - 1.0f) < eps;
+}
+
+const char* simd_backend() {
+    return simd::backend_name();
 }
 
 } // namespace kvann

@@ -1,203 +1,154 @@
-/**
- * user_data 功能测试
- */
+// kvann payload (user_data) tests — v0.2 API
 
+#include <kvann/core.h>
 #include <kvann/index.h>
-#include <iostream>
+
+#include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <random>
+#include <vector>
 
 using namespace kvann;
 
-#define TEST_ASSERT(cond, msg) \
-    do { \
-        if (!(cond)) { \
-            std::cerr << "ASSERTION FAILED: " << msg << " at line " << __LINE__ << std::endl; \
-            std::exit(1); \
-        } \
-    } while(0)
+#define TEST_ASSERT(cond, msg)                                                 \
+    do {                                                                       \
+        if (!(cond)) {                                                         \
+            std::cerr << "ASSERT FAILED: " << msg << " @line " << __LINE__     \
+                      << std::endl;                                            \
+            std::exit(1);                                                      \
+        }                                                                      \
+    } while (0)
 
-void test_put_with_data() {
-    const size_t DIM = 128;
-    Index index(DIM, 1000);
-    
-    // 创建向量
-    std::vector<float> vec(DIM);
-    for (size_t i = 0; i < DIM; ++i) vec[i] = 1.0f;
-    normalize_vector(vec.data(), DIM);
-    
-    // 创建 user_data
-    const char* text = "Hello, kvann!";
-    size_t text_len = strlen(text) + 1;
-    
-    // 插入带 user_data 的向量
-    index.put_with_data(1, vec.data(), text, text_len);
-    
-    // 验证可以通过 get_user_data 获取
-    auto retrieved = index.get_user_data(1);
-    TEST_ASSERT(!retrieved.empty(), "user_data should not be empty");
-    TEST_ASSERT(retrieved.size() == text_len, "user_data size mismatch");
-    TEST_ASSERT(strcmp(reinterpret_cast<const char*>(retrieved.data()), text) == 0, 
-                "user_data content mismatch");
-    
-    std::cout << "  [PASS] put_with_data and get_user_data" << std::endl;
+namespace {
+
+IndexConfig cfg_for(std::size_t dim, std::size_t cap) {
+    IndexConfig c;
+    c.dim = dim;
+    c.max_elements = cap;
+    return c;
 }
 
-void test_search_with_user_data() {
-    const size_t DIM = 128;
-    Index index(DIM, 1000);
-    
-    // 插入多个带 user_data 的向量
+void test_put_with_payload() {
+    constexpr std::size_t DIM = 128;
+    Index index(cfg_for(DIM, 1000));
+
+    std::vector<float> v(DIM, 1.0f);
+    normalize_vector(v.data(), DIM);
+
+    const char* text = "Hello, kvann!";
+    auto st = index.put(1, v.data(), text, std::strlen(text) + 1);
+    TEST_ASSERT(st.ok(), "put failed");
+
+    std::vector<uint8_t> payload;
+    TEST_ASSERT(index.get_payload(1, payload).ok(), "get_payload");
+    TEST_ASSERT(payload.size() == std::strlen(text) + 1, "size");
+    TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(payload.data()), text) == 0,
+                "content");
+    std::cout << "  [PASS] put + get_payload\n";
+}
+
+void test_search_includes_payload() {
+    constexpr std::size_t DIM = 128;
+    Index index(cfg_for(DIM, 1000));
     std::mt19937 rng(42);
     std::normal_distribution<float> dist(0, 1);
-    
+
     for (int i = 0; i < 10; ++i) {
-        std::vector<float> vec(DIM);
-        for (auto& v : vec) v = dist(rng);
-        normalize_vector(vec.data(), DIM);
-        
-        // 每个key有不同的user_data
+        std::vector<float> v(DIM);
+        for (auto& x : v) x = dist(rng);
+        normalize_vector(v.data(), DIM);
+
         std::string data = "data_for_key_" + std::to_string(i);
-        index.put_with_data(i, vec.data(), data.c_str(), data.size() + 1);
+        index.put(i, v.data(), data.data(), data.size() + 1);
     }
-    
     index.rebuild();
-    index.wait_rebuild();
-    
-    // 搜索
-    std::vector<float> query(DIM);
-    for (auto& v : query) v = dist(rng);
-    normalize_vector(query.data(), DIM);
-    
-    auto results = index.search(query.data(), 5);
-    
-    // 验证可按需获取 user_data
-    for (const auto& r : results) {
-        auto data = index.get_user_data(r.key);
-        TEST_ASSERT(!data.empty(), "user_data should be retrievable by key");
-        std::string expected_prefix = "data_for_key_";
-        std::string actual(reinterpret_cast<const char*>(data.data()));
-        TEST_ASSERT(actual.find(expected_prefix) == 0, 
-                    "user_data should start with expected prefix");
+
+    std::vector<float> q(DIM);
+    for (auto& x : q) x = dist(rng);
+    normalize_vector(q.data(), DIM);
+
+    SearchParams sp;
+    sp.topk = 5;
+    sp.include_payload = true;
+    auto r = index.search(q.data(), sp);
+
+    for (const auto& s : r) {
+        TEST_ASSERT(!s.payload.empty(), "payload populated");
+        std::string actual(reinterpret_cast<const char*>(s.payload.data()));
+        TEST_ASSERT(actual.find("data_for_key_") == 0, "prefix");
     }
-    
-    std::cout << "  [PASS] search + get_user_data" << std::endl;
+    std::cout << "  [PASS] search includes payload\n";
 }
 
-void test_update_user_data() {
-    const size_t DIM = 128;
-    Index index(DIM, 1000);
-    
-    std::vector<float> vec(DIM);
-    for (size_t i = 0; i < DIM; ++i) vec[i] = 1.0f;
-    normalize_vector(vec.data(), DIM);
-    
-    // 第一次插入
-    const char* data1 = "original_data";
-    index.put_with_data(1, vec.data(), data1, strlen(data1) + 1);
-    
-    auto retrieved1 = index.get_user_data(1);
-    TEST_ASSERT(strcmp(reinterpret_cast<const char*>(retrieved1.data()), data1) == 0,
-                "Original data mismatch");
-    
-    // 更新 user_data（保持向量不变）
-    const char* data2 = "updated_data";
-    index.put_with_data(1, vec.data(), data2, strlen(data2) + 1);
-    
-    auto retrieved2 = index.get_user_data(1);
-    TEST_ASSERT(strcmp(reinterpret_cast<const char*>(retrieved2.data()), data2) == 0,
-                "Updated data mismatch");
-    
-    std::cout << "  [PASS] update user_data" << std::endl;
+void test_update_payload() {
+    constexpr std::size_t DIM = 128;
+    Index index(cfg_for(DIM, 1000));
+    std::vector<float> v(DIM, 1.0f);
+    normalize_vector(v.data(), DIM);
+
+    const char* a = "original";
+    index.put(1, v.data(), a, std::strlen(a) + 1);
+    std::vector<uint8_t> p;
+    index.get_payload(1, p);
+    TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(p.data()), a) == 0, "v1");
+
+    const char* b = "updated_data";
+    index.put(1, v.data(), b, std::strlen(b) + 1);
+    index.get_payload(1, p);
+    TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(p.data()), b) == 0, "v2");
+    std::cout << "  [PASS] update payload\n";
 }
 
-void test_persistence_with_user_data() {
-    const size_t DIM = 128;
-    const char* TEST_FILE = "/tmp/kvann_userdata_test.index";
-    
-    // 创建并保存
+void test_persistence_with_payload() {
+    constexpr std::size_t DIM = 128;
+    const char* PATH = "/tmp/kvann_v2_userdata.index";
     {
-        Index index(DIM, 1000);
-        
-        std::vector<float> vec(DIM);
-        for (size_t i = 0; i < DIM; ++i) vec[i] = 0.5f;
-        normalize_vector(vec.data(), DIM);
-        
-        const char* data = "persistent_data_12345";
-        index.put_with_data(1, vec.data(), data, strlen(data) + 1);
-        
-        index.save(TEST_FILE);
+        Index index(cfg_for(DIM, 1000));
+        std::vector<float> v(DIM, 0.5f);
+        normalize_vector(v.data(), DIM);
+        const char* d = "persistent_12345";
+        index.put(1, v.data(), d, std::strlen(d) + 1);
+        TEST_ASSERT(index.save(PATH).ok(), "save");
     }
-    
-    // 加载并验证
     {
-        auto index = Index::load(TEST_FILE);
-        
-        auto retrieved = index->get_user_data(1);
-        TEST_ASSERT(!retrieved.empty(), "user_data should persist");
-        TEST_ASSERT(strcmp(reinterpret_cast<const char*>(retrieved.data()), 
-                          "persistent_data_12345") == 0,
-                    "user_data content should persist correctly");
+        auto idx = Index::load(PATH);
+        std::vector<uint8_t> p;
+        TEST_ASSERT(idx->get_payload(1, p).ok(), "get after load");
+        TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(p.data()),
+                                "persistent_12345") == 0, "content");
     }
-    
-    std::remove(TEST_FILE);
-    std::cout << "  [PASS] persistence with user_data" << std::endl;
+    std::remove(PATH);
+    std::cout << "  [PASS] persistence with payload\n";
 }
 
-void test_empty_user_data() {
-    const size_t DIM = 128;
-    Index index(DIM, 1000);
-    
-    std::vector<float> vec(DIM);
-    for (size_t i = 0; i < DIM; ++i) vec[i] = 1.0f;
-    normalize_vector(vec.data(), DIM);
-    
-    // 使用普通 put（无 user_data）
-    index.put(1, vec.data());
-    
-    auto retrieved = index.get_user_data(1);
-    TEST_ASSERT(retrieved.empty(), "user_data should be empty for put without data");
-    
-    // 搜索不应包含 user_data（按需获取）
-    index.rebuild();
-    index.wait_rebuild();
-    
-    auto results = index.search(vec.data(), 1);
-    TEST_ASSERT(!results.empty(), "Should find the vector");
-    auto data = index.get_user_data(results[0].key);
-    TEST_ASSERT(data.empty(), "user_data should be empty for put without data");
-    
-    std::cout << "  [PASS] empty user_data handling" << std::endl;
+void test_no_payload() {
+    constexpr std::size_t DIM = 128;
+    Index index(cfg_for(DIM, 1000));
+    std::vector<float> v(DIM, 1.0f);
+    normalize_vector(v.data(), DIM);
+
+    index.put(1, v.data());
+    std::vector<uint8_t> p;
+    auto st = index.get_payload(1, p);
+    TEST_ASSERT(st.ok() && p.empty(), "empty payload for plain put");
+    std::cout << "  [PASS] no-payload\n";
 }
+
+} // namespace
 
 int main() {
-    std::cout << "========================================" << std::endl;
-    std::cout << "user_data Test Suite" << std::endl;
-    std::cout << "========================================" << std::endl;
-    
+    std::cout << "==== user_data tests ====\n";
     try {
-        std::cout << "\n[TEST] test_put_with_data..." << std::endl;
-        test_put_with_data();
-        
-        std::cout << "\n[TEST] test_search_with_user_data..." << std::endl;
-        test_search_with_user_data();
-        
-        std::cout << "\n[TEST] test_update_user_data..." << std::endl;
-        test_update_user_data();
-        
-        std::cout << "\n[TEST] test_persistence_with_user_data..." << std::endl;
-        test_persistence_with_user_data();
-        
-        std::cout << "\n[TEST] test_empty_user_data..." << std::endl;
-        test_empty_user_data();
-        
-        std::cout << "\n========================================" << std::endl;
-        std::cout << "ALL USER_DATA TESTS PASSED!" << std::endl;
-        std::cout << "========================================" << std::endl;
-        
+        test_put_with_payload();
+        test_search_includes_payload();
+        test_update_payload();
+        test_persistence_with_payload();
+        test_no_payload();
+        std::cout << "\nALL USER_DATA TESTS PASSED\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << "\nTEST FAILED WITH EXCEPTION: " << e.what() << std::endl;
+        std::cerr << "EXCEPTION: " << e.what() << std::endl;
         return 1;
     }
 }

@@ -1,96 +1,94 @@
-/**
- * kvann 使用示例
- * 展示基本功能 + user_data 功能
- */
+// kvann 使用示例（v0.2 API）
 
+#include <kvann/core.h>
 #include <kvann/index.h>
+
 #include <iostream>
 #include <random>
 #include <vector>
 
-// 生成随机归一化向量
-std::vector<float> random_vector(size_t dim, std::mt19937& rng) {
+namespace {
+
+std::vector<float> random_vector(std::size_t dim, std::mt19937& rng) {
     std::normal_distribution<float> dist(0, 1);
-    std::vector<float> vec(dim);
-    for (auto& v : vec) v = dist(rng);
-    kvann::normalize_vector(vec.data(), dim);
-    return vec;
+    std::vector<float> v(dim);
+    for (auto& x : v) x = dist(rng);
+    kvann::normalize_vector(v.data(), dim);
+    return v;
 }
 
 void example_basic() {
-    std::cout << "\n=== 示例1: 基础功能 ===" << std::endl;
-    
-    const size_t DIM = 128;
-    const int N = 100;
-    
-    kvann::Index index(DIM, N * 2);
+    std::cout << "\n=== example: basic put/search ===\n";
+
+    constexpr std::size_t DIM = 128;
+    constexpr int N = 100;
+
+    kvann::IndexConfig cfg;
+    cfg.dim = DIM;
+    cfg.max_elements = N * 2;
+
+    kvann::Index index(cfg);
     std::mt19937 rng(42);
-    
-    // 插入向量
-    std::vector<std::vector<float>> vectors;
+
+    std::vector<std::vector<float>> vecs;
     for (int i = 0; i < N; ++i) {
-        auto vec = random_vector(DIM, rng);
-        vectors.push_back(vec);
-        index.put(i, vec.data());
+        auto v = random_vector(DIM, rng);
+        vecs.push_back(v);
+        auto st = index.put(static_cast<kvann::Key>(i), v.data());
+        if (!st.ok()) std::cerr << "put failed: " << st.code_str() << "\n";
     }
-    
-    // 重建
     index.rebuild();
-    index.wait_rebuild();
-    
-    // 搜索
-    auto results = index.search(vectors[0].data(), 5);
-    
-    std::cout << "Top-5 搜索结果:" << std::endl;
+
+    kvann::SearchParams sp;
+    sp.topk = 5;
+    auto results = index.search(vecs[0].data(), sp);
+
+    std::cout << "top-5 (SIMD backend = " << kvann::simd_backend() << "):\n";
     for (const auto& r : results) {
-        std::cout << "  key=" << r.key << " score=" << r.score << std::endl;
+        std::cout << "  key=" << r.key << " score=" << r.score << "\n";
     }
 }
 
-void example_user_data() {
-    std::cout << "\n=== 示例2: 带 user_data 的向量 ===" << std::endl;
-    
-    const size_t DIM = 128;
-    const int N = 50;
-    
-    kvann::Index index(DIM, N * 2);
-    std::mt19937 rng(42);
-    
-    // 插入带 user_data 的向量（例如：文本、标签、元数据等）
+void example_payload() {
+    std::cout << "\n=== example: payload + filter + batch ===\n";
+
+    constexpr std::size_t DIM = 64;
+    constexpr int N = 50;
+
+    kvann::IndexConfig cfg;
+    cfg.dim = DIM;
+    cfg.max_elements = N * 2;
+
+    kvann::Index index(cfg);
+    std::mt19937 rng(7);
+
     for (int i = 0; i < N; ++i) {
-        auto vec = random_vector(DIM, rng);
-        
-        // user_data 可以是任意二进制数据
-        std::string metadata = "document_" + std::to_string(i) + ":这是一个示例文档";
-        index.put_with_data(i, vec.data(), metadata.c_str(), metadata.size() + 1);
+        auto v = random_vector(DIM, rng);
+        std::string meta = "doc_" + std::to_string(i);
+        index.put(i, v.data(), meta.data(), meta.size() + 1);
     }
-    
     index.rebuild();
-    index.wait_rebuild();
-    
-    // 搜索并按需获取 user_data
+
+    kvann::SearchParams sp;
+    sp.topk = 5;
+    sp.include_payload = true;
+    sp.filter = [](kvann::Key k) { return k % 2 == 0; };  // 仅偶数 key
+
     auto query = random_vector(DIM, rng);
-    auto results = index.search(query.data(), 5);
-    
-    std::cout << "搜索结果（含user_data）:" << std::endl;
+    auto results = index.search(query.data(), sp);
+
     for (const auto& r : results) {
-        auto data = index.get_user_data(r.key);
-        std::string user_data_str(reinterpret_cast<const char*>(data.data()));
-        std::cout << "  key=" << r.key << " score=" << r.score 
-                  << " data=" << user_data_str << std::endl;
+        std::cout << "  key=" << r.key << " score=" << r.score
+                  << " payload=" << reinterpret_cast<const char*>(r.payload.data())
+                  << "\n";
     }
 }
+
+} // namespace
 
 int main() {
-    std::cout << "========================================" << std::endl;
-    std::cout << "kvann 向量检索引擎 - 使用示例" << std::endl;
-    std::cout << "========================================" << std::endl;
-    
+    std::cout << "kvann " << kvann::simd_backend() << " backend\n";
     example_basic();
-    example_user_data();
-    
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "所有示例完成！" << std::endl;
-    std::cout << "========================================" << std::endl;
+    example_payload();
     return 0;
 }

@@ -1,5 +1,30 @@
-#include <kvann/index.h>
+// kvann - Index implementation
+//
+// Internal layering (top to bottom):
+//   Index::Impl                  orchestration / public API
+//   HnswGraph                    HNSW with arena-based layer-0 neighbors
+//   DeltaSet                     alive-bitmap + member list for delta layer
+//   KeyDir                       sharded Key -> {Slot, payload, version}
+//   SlotKeyMap                   dense Slot -> Key (atomic)
+//   VectorStore                  aligned per-slot vectors with seqlock writes
+//   VisitedPool                  thread-local epoch-tagged visited buffers
+//
+// Concurrency model:
+//   * Reads (search, get_payload, exists)  use shared/atomic paths.
+//   * Writes (put, del)                    take per-stripe write locks for KeyDir
+//                                          and per-slot mutexes for HNSW updates.
+//   * VectorStore writes use a seqlock so concurrent searches never observe
+//     torn data without retrying.
+//   * rebuild() takes a snapshot of (key, slot, vector) so the new graph builds
+//     against frozen data; live writes keep flowing into delta.
+
 #include <kvann/core.h>
+#include <kvann/index.h>
+#include <kvann/status.h>
+#include <kvann/detail/alloc.h>
+#include <kvann/detail/arch.h>
+#include <kvann/detail/log.h>
+#include <kvann/detail/simd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -7,1216 +32,1220 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <functional>
-#include <future>
-#include <iostream>
+#include <memory>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <random>
 #include <shared_mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace kvann {
+namespace {
 
 // ============================================================================
-// 内部数据结构（非公开）
+// Helpers
 // ============================================================================
+constexpr size_t kVecAlign = 64;
 
-struct VectorMeta {
-    Slot slot;
-    bool tombstone;
-    uint64_t version;
-    std::vector<uint8_t> user_data;
+inline size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
-    VectorMeta() : slot(INVALID_SLOT), tombstone(false), version(0) {}
-    VectorMeta(Slot s) : slot(s), tombstone(false), version(1) {}
-};
+inline void emit_log(const IndexConfig& cfg, const char* level, const char* msg) {
+    if (cfg.log_sink) cfg.log_sink(level, msg);
+}
 
-class VectorStorage {
+// ============================================================================
+// VectorStore
+//   - aligned 64B blocks
+//   - per-slot seqlock so concurrent reads can detect torn writes and retry
+//   - dot_with(slot, query) returns the SIMD dot product safely w/o copying
+// ============================================================================
+class VectorStore {
 public:
-    VectorStorage(size_t dim, size_t initial_capacity = 1024, size_t block_size = 4096)
+    VectorStore(size_t dim, size_t max_elements, size_t block_size)
         : dim_(dim),
-          block_size_(block_size),
-          capacity_(initial_capacity),
-          size_(0) {
-        if (block_size_ == 0) {
-            block_size_ = 4096;
-        }
-        reserve_blocks_for_capacity(capacity_);
+          dim_padded_(round_up(dim, 8)),  // 32-byte / 8-float alignment for AVX
+          block_size_(block_size ? block_size : 4096),
+          max_elements_(max_elements),
+          version_(max_elements) {
+        // Pre-allocate enough blocks to cover max_elements lazily on demand.
+        size_t needed = (max_elements_ + block_size_ - 1) / block_size_;
+        blocks_.reserve(needed);
+        for (auto& v : version_) v.store(0, std::memory_order_relaxed);
     }
 
-    ~VectorStorage() {
-        for (auto* block : blocks_) {
-            free(block);
-        }
+    ~VectorStore() {
+        for (auto* b : blocks_) detail::aligned_free(b);
     }
 
-    VectorStorage(const VectorStorage&) = delete;
-    VectorStorage& operator=(const VectorStorage&) = delete;
-
-    VectorStorage(VectorStorage&& other) noexcept
-        : blocks_(std::move(other.blocks_)),
-          dim_(other.dim_),
-          block_size_(other.block_size_),
-          capacity_(other.capacity_),
-          size_(other.size_),
-          free_slots_(std::move(other.free_slots_)) {
-        other.capacity_ = 0;
-        other.size_ = 0;
-    }
-
-    Slot allocate_slot() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (free_slots_.empty()) {
-            if (size_ >= capacity_) {
-                expand();
-            }
-            return size_++;
-        }
-        Slot slot = free_slots_.back();
-        free_slots_.pop_back();
-        return slot;
-    }
-
-    void release_slot(Slot slot) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        free_slots_.push_back(slot);
-    }
-
-    void set_vector(Slot slot, const float* vec) {
-        float* dst = get_vector(slot);
-        std::memcpy(dst, vec, dim_ * sizeof(float));
-    }
-
-    const float* get_vector(Slot slot) const {
-        return get_vector_ptr(slot);
-    }
-
-    float* get_vector(Slot slot) {
-        return get_vector_ptr(slot);
-    }
-
-    float* get_buffer(Slot slot) {
-        return get_vector_ptr(slot);
-    }
+    VectorStore(const VectorStore&) = delete;
+    VectorStore& operator=(const VectorStore&) = delete;
 
     size_t dim() const { return dim_; }
-    size_t size() const { return size_; }
-    size_t capacity() const { return capacity_; }
+    size_t max_elements() const { return max_elements_; }
 
-    void save(std::ofstream& out) const {
-        out.write(reinterpret_cast<const char*>(&dim_), sizeof(dim_));
-        out.write(reinterpret_cast<const char*>(&size_), sizeof(size_));
-        for (size_t i = 0; i < size_; ++i) {
-            const float* vec = get_vector(static_cast<Slot>(i));
-            out.write(reinterpret_cast<const char*>(vec), dim_ * sizeof(float));
+    void set_vector(Slot slot, const float* src) {
+        ensure_block(slot);
+        auto& v = version_[slot];
+        v.fetch_add(1, std::memory_order_acq_rel);  // -> odd (writing)
+        float* dst = slot_ptr(slot);
+        std::memcpy(dst, src, dim_ * sizeof(float));
+        // pad bytes don't need init for dot; we sized arena to dim_padded_.
+        v.fetch_add(1, std::memory_order_release);  // -> even (stable)
+    }
+
+    // Optimistic SIMD dot. Retries if a writer touched the slot mid-read.
+    KVANN_FORCE_INLINE float dot_with(Slot slot, const float* query) const {
+        auto& v = version_[slot];
+        for (;;) {
+            uint32_t v0 = v.load(std::memory_order_acquire);
+            if (KVANN_UNLIKELY(v0 & 1u)) continue;
+            float d = simd::dot_f32(slot_ptr_const(slot), query, dim_);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            uint32_t v1 = v.load(std::memory_order_acquire);
+            if (KVANN_LIKELY(v0 == v1)) return d;
         }
     }
 
-    void load(std::ifstream& in) {
-        in.read(reinterpret_cast<char*>(&dim_), sizeof(dim_));
-        in.read(reinterpret_cast<char*>(&size_), sizeof(size_));
+    // Snapshot copy for rebuild: stable since we hold KeyDir read locks externally.
+    void copy_vector(Slot slot, float* dst) const {
+        auto& v = version_[slot];
+        for (;;) {
+            uint32_t v0 = v.load(std::memory_order_acquire);
+            if (v0 & 1u) continue;
+            std::memcpy(dst, slot_ptr_const(slot), dim_ * sizeof(float));
+            std::atomic_thread_fence(std::memory_order_acquire);
+            uint32_t v1 = v.load(std::memory_order_acquire);
+            if (v0 == v1) return;
+        }
+    }
 
-        clear_blocks();
-        capacity_ = (size_ > 0) ? size_ : 1;
-        reserve_blocks_for_capacity(capacity_);
+    // Persistence helpers
+    void save_meta(std::ofstream& out) const {
+        out.write(reinterpret_cast<const char*>(&dim_), sizeof(dim_));
+        out.write(reinterpret_cast<const char*>(&max_elements_), sizeof(max_elements_));
+        out.write(reinterpret_cast<const char*>(&block_size_), sizeof(block_size_));
+    }
 
-        for (size_t i = 0; i < size_; ++i) {
-            float* vec = get_vector(static_cast<Slot>(i));
-            in.read(reinterpret_cast<char*>(vec), dim_ * sizeof(float));
+    static VectorStore load(std::ifstream& in) {
+        size_t dim, max_el, blk;
+        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+        in.read(reinterpret_cast<char*>(&max_el), sizeof(max_el));
+        in.read(reinterpret_cast<char*>(&blk), sizeof(blk));
+        return VectorStore(dim, max_el, blk);
+    }
+
+    // Write payload of all live slots (caller passes the slot list).
+    void save_vectors(std::ofstream& out, const std::vector<Slot>& slots) const {
+        size_t n = slots.size();
+        out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        std::vector<float> tmp(dim_);
+        for (Slot s : slots) {
+            copy_vector(s, tmp.data());
+            out.write(reinterpret_cast<const char*>(tmp.data()), dim_ * sizeof(float));
+        }
+    }
+
+    // Loads vectors into the given slot list. Caller must have ensured slots are valid.
+    void load_vectors(std::ifstream& in, const std::vector<Slot>& slots) {
+        size_t n;
+        in.read(reinterpret_cast<char*>(&n), sizeof(n));
+        if (n != slots.size()) {
+            throw std::runtime_error("vector count mismatch on load");
+        }
+        std::vector<float> tmp(dim_);
+        for (Slot s : slots) {
+            in.read(reinterpret_cast<char*>(tmp.data()), dim_ * sizeof(float));
+            set_vector(s, tmp.data());
         }
     }
 
 private:
-    void expand() {
-        size_t new_capacity = capacity_ * 2;
-        reserve_blocks_for_capacity(new_capacity);
-        capacity_ = new_capacity;
-    }
-
-    static size_t round_up_64(size_t bytes) {
-        return (bytes + 63u) & ~size_t(63u);
-    }
-
-    static float* alloc_aligned_floats(size_t count) {
-        size_t bytes = round_up_64(count * sizeof(float));
-        void* ptr = nullptr;
-        if (bytes == 0) {
-            bytes = 64;
-        }
-        if (posix_memalign(&ptr, 64, bytes) != 0) {
-            return nullptr;
-        }
-        return static_cast<float*>(ptr);
-    }
-
-    float* get_vector_ptr(Slot slot) const {
-        size_t block_index = slot / block_size_;
-        size_t offset = slot % block_size_;
-        if (block_index >= blocks_.size()) {
-            return nullptr;
-        }
-        return blocks_[block_index] + offset * dim_;
-    }
-
-    void reserve_blocks_for_capacity(size_t capacity) {
-        size_t needed_blocks = (capacity + block_size_ - 1) / block_size_;
-        while (blocks_.size() < needed_blocks) {
-            float* block = alloc_aligned_floats(block_size_ * dim_);
-            if (!block) {
-                throw std::bad_alloc();
-            }
-            blocks_.push_back(block);
+    void ensure_block(Slot slot) {
+        size_t block_idx = slot / block_size_;
+        std::lock_guard<std::mutex> lk(grow_mutex_);
+        while (blocks_.size() <= block_idx) {
+            size_t bytes = round_up(block_size_ * dim_padded_ * sizeof(float), kVecAlign);
+            blocks_.push_back(static_cast<float*>(detail::aligned_alloc_bytes(kVecAlign, bytes)));
         }
     }
 
-    void clear_blocks() {
-        for (auto* block : blocks_) {
-            free(block);
-        }
-        blocks_.clear();
+    KVANN_FORCE_INLINE float* slot_ptr(Slot slot) {
+        return blocks_[slot / block_size_] + (slot % block_size_) * dim_padded_;
+    }
+    KVANN_FORCE_INLINE const float* slot_ptr_const(Slot slot) const {
+        return blocks_[slot / block_size_] + (slot % block_size_) * dim_padded_;
     }
 
-    std::vector<float*> blocks_;
     size_t dim_;
+    size_t dim_padded_;
     size_t block_size_;
-    size_t capacity_;
-    size_t size_;
-    std::vector<Slot> free_slots_;
-    mutable std::mutex mutex_;
+    size_t max_elements_;
+    std::vector<float*> blocks_;
+    mutable std::mutex grow_mutex_;
+    mutable std::vector<std::atomic<uint32_t>> version_;
 };
 
-class KeyManager {
+// ============================================================================
+// SlotKeyMap (dense, atomic)
+// ============================================================================
+class SlotKeyMap {
 public:
-    explicit KeyManager(size_t stripes)
-        : stripes_(stripes ? stripes : 1),
-          key_maps_(stripes_),
-          key_mutexes_(stripes_),
-          slot_mutex_() {}
-
-    bool exists(Key key) const {
-        auto& mutex = key_mutexes_[stripe(key)];
-        std::shared_lock<std::shared_mutex> lock(mutex);
-        auto& map = key_maps_[stripe(key)];
-        auto it = map.find(key);
-        return it != map.end() && !it->second.tombstone;
+    explicit SlotKeyMap(size_t cap) : data_(cap) {
+        for (auto& a : data_) a.store(kInvalidKey, std::memory_order_relaxed);
     }
 
-    std::optional<VectorMeta> get_meta(Key key) const {
-        auto& mutex = key_mutexes_[stripe(key)];
-        std::shared_lock<std::shared_mutex> lock(mutex);
-        auto& map = key_maps_[stripe(key)];
-        auto it = map.find(key);
-        if (it != map.end()) {
-            return it->second;
-        }
-        return std::nullopt;
+    KVANN_FORCE_INLINE Key get(Slot s) const {
+        return data_[s].load(std::memory_order_acquire);
+    }
+    void set(Slot s, Key k) {
+        data_[s].store(k, std::memory_order_release);
+    }
+    void clear(Slot s) {
+        data_[s].store(kInvalidKey, std::memory_order_release);
+    }
+    size_t capacity() const { return data_.size(); }
+
+private:
+    std::vector<std::atomic<Key>> data_;
+};
+
+// ============================================================================
+// KeyDir (sharded)
+//   Maps Key -> { slot, payload, version }.
+//   Liveness is encoded in SlotKeyMap (slot_key == key  =>  live).
+// ============================================================================
+struct KeyEntry {
+    Slot slot = kInvalidSlot;
+    uint64_t version = 0;
+    std::vector<uint8_t> payload;
+};
+
+class KeyDir {
+public:
+    explicit KeyDir(size_t stripes) : stripes_(stripes ? stripes : 1),
+                                      maps_(stripes_), mutexes_(stripes_) {}
+
+    // Read-side: returns a copy of the entry if present.
+    bool find(Key k, KeyEntry& out) const {
+        size_t s = stripe(k);
+        std::shared_lock lk(mutexes_[s]);
+        auto it = maps_[s].find(k);
+        if (it == maps_[s].end()) return false;
+        out = it->second;
+        return true;
     }
 
-    std::optional<Key> get_key_by_slot(Slot slot) const {
-        std::shared_lock<std::shared_mutex> lock(slot_mutex_);
-        auto it = slot_to_key_.find(slot);
-        if (it != slot_to_key_.end()) {
-            return it->second;
-        }
-        return std::nullopt;
+    bool contains(Key k) const {
+        size_t s = stripe(k);
+        std::shared_lock lk(mutexes_[s]);
+        return maps_[s].find(k) != maps_[s].end();
     }
 
-    void put(Key key, const VectorMeta& meta) {
-        auto& mutex = key_mutexes_[stripe(key)];
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        key_maps_[stripe(key)][key] = meta;
-        {
-            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
-            slot_to_key_[meta.slot] = key;
-        }
+    // Insert or update. cb is called under the stripe write lock with a mutable
+    // reference to the (possibly new) entry. Returns whatever cb returns.
+    template <class Fn>
+    auto with_write(Key k, Fn&& cb) -> decltype(cb(std::declval<KeyEntry&>(), false)) {
+        size_t s = stripe(k);
+        std::unique_lock lk(mutexes_[s]);
+        auto [it, inserted] = maps_[s].emplace(k, KeyEntry{});
+        return cb(it->second, inserted);
     }
 
-    bool del(Key key) {
-        auto& mutex = key_mutexes_[stripe(key)];
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        auto& map = key_maps_[stripe(key)];
-        auto it = map.find(key);
-        if (it != map.end()) {
-            it->second.tombstone = true;
-            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
-            slot_to_key_.erase(it->second.slot);
-            return true;
-        }
-        return false;
+    bool erase(Key k) {
+        size_t s = stripe(k);
+        std::unique_lock lk(mutexes_[s]);
+        return maps_[s].erase(k) > 0;
     }
 
-    void update_meta(Key key, const VectorMeta& meta) {
-        auto& mutex = key_mutexes_[stripe(key)];
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        key_maps_[stripe(key)][key] = meta;
-        {
-            std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
-            slot_to_key_[meta.slot] = key;
-        }
-    }
-
-    std::vector<std::pair<Key, Slot>> get_all_live() const {
-        std::vector<std::pair<Key, Slot>> result;
+    // Snapshot of all entries (under stripe read locks). Used by rebuild + save.
+    std::vector<std::pair<Key, KeyEntry>> snapshot_all() const {
+        std::vector<std::pair<Key, KeyEntry>> out;
         for (size_t i = 0; i < stripes_; ++i) {
-            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
-            for (const auto& [key, meta] : key_maps_[i]) {
-                if (!meta.tombstone) {
-                    result.emplace_back(key, meta.slot);
-                }
-            }
+            std::shared_lock lk(mutexes_[i]);
+            for (const auto& [k, e] : maps_[i]) out.emplace_back(k, e);
         }
-        return result;
+        return out;
     }
 
-    void get_stats(size_t& total, size_t& live, size_t& tombstones) const {
-        total = 0;
-        live = 0;
-        tombstones = 0;
+    size_t size() const {
+        size_t total = 0;
         for (size_t i = 0; i < stripes_; ++i) {
-            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
-            total += key_maps_[i].size();
-            for (const auto& [key, meta] : key_maps_[i]) {
-                if (meta.tombstone) {
-                    tombstones++;
-                } else {
-                    live++;
-                }
-            }
+            std::shared_lock lk(mutexes_[i]);
+            total += maps_[i].size();
         }
+        return total;
     }
 
     void clear() {
         for (size_t i = 0; i < stripes_; ++i) {
-            std::unique_lock<std::shared_mutex> lock(key_mutexes_[i]);
-            key_maps_[i].clear();
-        }
-        std::unique_lock<std::shared_mutex> slot_lock(slot_mutex_);
-        slot_to_key_.clear();
-    }
-
-    void save(std::ofstream& out) const {
-        size_t size = 0;
-        for (size_t i = 0; i < stripes_; ++i) {
-            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
-            size += key_maps_[i].size();
-        }
-        out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-        for (size_t i = 0; i < stripes_; ++i) {
-            std::shared_lock<std::shared_mutex> lock(key_mutexes_[i]);
-            for (const auto& [key, meta] : key_maps_[i]) {
-                out.write(reinterpret_cast<const char*>(&key), sizeof(key));
-                out.write(reinterpret_cast<const char*>(&meta.slot), sizeof(meta.slot));
-                out.write(reinterpret_cast<const char*>(&meta.tombstone), sizeof(meta.tombstone));
-                out.write(reinterpret_cast<const char*>(&meta.version), sizeof(meta.version));
-
-                size_t user_data_size = meta.user_data.size();
-                out.write(reinterpret_cast<const char*>(&user_data_size), sizeof(user_data_size));
-                if (user_data_size > 0) {
-                    out.write(reinterpret_cast<const char*>(meta.user_data.data()), user_data_size);
-                }
-            }
-        }
-    }
-
-    void load(std::ifstream& in) {
-        clear();
-        size_t size;
-        in.read(reinterpret_cast<char*>(&size), sizeof(size));
-        for (size_t i = 0; i < size; ++i) {
-            Key key;
-            VectorMeta meta;
-            in.read(reinterpret_cast<char*>(&key), sizeof(key));
-            in.read(reinterpret_cast<char*>(&meta.slot), sizeof(meta.slot));
-            in.read(reinterpret_cast<char*>(&meta.tombstone), sizeof(meta.tombstone));
-            in.read(reinterpret_cast<char*>(&meta.version), sizeof(meta.version));
-
-            size_t user_data_size;
-            in.read(reinterpret_cast<char*>(&user_data_size), sizeof(user_data_size));
-            if (user_data_size > 0) {
-                meta.user_data.resize(user_data_size);
-                in.read(reinterpret_cast<char*>(meta.user_data.data()), user_data_size);
-            }
-
-            put(key, meta);
+            std::unique_lock lk(mutexes_[i]);
+            maps_[i].clear();
         }
     }
 
 private:
-    size_t stripe(Key key) const { return key % stripes_; }
+    size_t stripe(Key k) const { return k % stripes_; }
 
     size_t stripes_;
-    std::vector<std::unordered_map<Key, VectorMeta>> key_maps_;
-    mutable std::vector<std::shared_mutex> key_mutexes_;
-
-    mutable std::shared_mutex slot_mutex_;
-    std::unordered_map<Slot, Key> slot_to_key_;
+    std::vector<std::unordered_map<Key, KeyEntry>> maps_;
+    mutable std::vector<std::shared_mutex> mutexes_;
 };
 
 // ============================================================================
-// HNSW 实现（内部）
+// HnswGraph
+//   Layer 0  : flat arena of Slot[] + uint8_t degrees (hot, dominant cost)
+//   Upper L  : sparse vector<vector<Slot>> per slot (rare)
+//   Per-slot mutex pool (NUM_STRIPES) protects write-side; reads are lock-free
+//   on degrees + neighbor cells (degrees use acquire/release).
 // ============================================================================
-
-struct HNSWNode {
-    Slot slot;
-    std::vector<std::vector<Slot>> neighbors;
-
-    HNSWNode() : slot(INVALID_SLOT) {}
-    explicit HNSWNode(Slot s, int max_level) : slot(s) {
-        neighbors.resize(max_level + 1);
-    }
-};
-
-class HNSWIndex {
+class HnswGraph {
 public:
-    HNSWIndex(size_t dim, size_t max_elements, int M = 16, int ef_construction = 200)
-        : dim_(dim), max_elements_(max_elements), M_(M), M_max_(M),
-          ef_construction_(ef_construction), enterpoint_(INVALID_SLOT),
-          max_level_(-1), size_(0), vector_data_(nullptr) {
-
-        nodes_.reserve(max_elements);
-        rng_.seed(42);
-        level_gen_ = std::geometric_distribution<int>(1.0 / std::log(M));
+    HnswGraph(size_t dim, size_t max_elements, int M, int M_max0, int ef_construction)
+        : dim_(dim),
+          max_elements_(max_elements),
+          M_(M),
+          M_max0_(M_max0),
+          ef_construction_(ef_construction),
+          enterpoint_(kInvalidSlot),
+          max_layer_(-1),
+          size_(0),
+          mutex_stripes_(kStripeN),
+          layer0_arena_(max_elements * static_cast<size_t>(M_max0)),
+          layer0_deg_(max_elements),
+          node_top_(max_elements),
+          upper_(max_elements) {
+        for (auto& d : layer0_deg_) d.store(0, std::memory_order_relaxed);
+        for (auto& t : node_top_) t.store(-1, std::memory_order_relaxed);
+        rng_.seed(0xC0FFEEULL);
+        level_dist_ = std::geometric_distribution<int>(1.0 / std::log(std::max(2, M)));
     }
 
-    HNSWIndex(const HNSWIndex&) = delete;
-    HNSWIndex& operator=(const HNSWIndex&) = delete;
+    HnswGraph(const HnswGraph&) = delete;
+    HnswGraph& operator=(const HnswGraph&) = delete;
 
-    HNSWIndex(HNSWIndex&& other) noexcept
-        : dim_(other.dim_), max_elements_(other.max_elements_), M_(other.M_),
-          M_max_(other.M_max_), ef_construction_(other.ef_construction_),
-          enterpoint_(other.enterpoint_), max_level_(other.max_level_),
-          size_(other.size_), nodes_(std::move(other.nodes_)),
-          vector_data_(other.vector_data_), rng_(other.rng_),
-          level_gen_(other.level_gen_) {
-        other.size_ = 0;
-        other.enterpoint_ = INVALID_SLOT;
-        other.max_level_ = -1;
-    }
+    HnswGraph(HnswGraph&&) noexcept = default;
+    HnswGraph& operator=(HnswGraph&&) = delete;
 
-    HNSWIndex& operator=(HNSWIndex&& other) noexcept {
-        if (this != &other) {
-            dim_ = other.dim_;
-            max_elements_ = other.max_elements_;
-            M_ = other.M_;
-            M_max_ = other.M_max_;
-            ef_construction_ = other.ef_construction_;
-            enterpoint_ = other.enterpoint_;
-            max_level_ = other.max_level_;
-            size_ = other.size_;
-            nodes_ = std::move(other.nodes_);
-            vector_data_ = other.vector_data_;
-            rng_ = other.rng_;
-            level_gen_ = other.level_gen_;
+    size_t size() const { return size_.load(std::memory_order_acquire); }
+    bool empty() const  { return size() == 0; }
+    int   dim() const   { return static_cast<int>(dim_); }
 
-            other.size_ = 0;
-            other.enterpoint_ = INVALID_SLOT;
-            other.max_level_ = -1;
-        }
-        return *this;
-    }
+    // Vector source: caller-supplied function: (Slot) -> dot(slot, query)
+    using DotFn = float(*)(const void* ctx, Slot s, const float* query);
 
-    void set_vector_source(const VectorStorage* storage) {
-        vector_data_ = storage;
-    }
+    // Add a vector that is *already stored* in the vector source.
+    void add(Slot slot, const float* vec, const void* ctx, DotFn dot_fn) {
+        int level = sample_level();
 
-    void add(Slot slot) {
-        if (size_ >= max_elements_) {
-            throw std::runtime_error("HNSW index is full");
-        }
-
-        int level = random_level();
-
-        std::unique_lock<std::shared_mutex> lock(global_mutex_);
-
-        if (slot >= nodes_.size()) {
-            nodes_.resize(slot + 1);
-        }
-
-        HNSWNode& node = nodes_[slot];
-        node.slot = slot;
-        node.neighbors.resize(level + 1);
-
-        const float* vec = vector_data_->get_vector(slot);
-
-        if (enterpoint_ == INVALID_SLOT) {
-            enterpoint_ = slot;
-            max_level_ = level;
-            size_++;
-            return;
-        }
-
-        Slot curr_ep = enterpoint_;
-        for (int lc = max_level_; lc > level; --lc) {
-            curr_ep = search_layer_simple(vec, curr_ep, lc);
-        }
-
-        for (int lc = std::min(level, max_level_); lc >= 0; --lc) {
-            auto candidates = search_layer(vec, curr_ep, ef_construction_, lc);
-            auto neighbors = select_neighbors(vec, candidates, M_);
-
-            for (Slot neighbor_slot : neighbors) {
-                node.neighbors[lc].push_back(neighbor_slot);
-                if (neighbor_slot < nodes_.size()) {
-                    nodes_[neighbor_slot].neighbors[lc].push_back(slot);
-                    shrink_connections(neighbor_slot, lc);
-                }
+        // Reserve slot in upper map
+        bool first = false;
+        {
+            std::unique_lock lk(global_mutex_);
+            if (slot >= max_elements_) {
+                throw std::runtime_error("HNSW slot out of range");
             }
-
-            if (!neighbors.empty()) {
-                curr_ep = neighbors[0];
+            if (size_.load(std::memory_order_relaxed) == 0) first = true;
+            size_.fetch_add(1, std::memory_order_release);
+            node_top_[slot].store(level, std::memory_order_release);
+            if (level > 0) {
+                upper_[slot].assign(level, {});
+                for (auto& v : upper_[slot]) v.reserve(static_cast<size_t>(M_));
+            }
+            if (first) {
+                enterpoint_ = slot;
+                max_layer_ = level;
+                return;
             }
         }
 
-        if (level > max_level_) {
-            max_level_ = level;
-            enterpoint_ = slot;
+        Slot ep = enterpoint_;
+        int top = max_layer_;
+        // Greedy descent on upper layers
+        for (int lc = top; lc > level; --lc) {
+            ep = greedy_descend(ep, vec, lc, ctx, dot_fn);
         }
 
-        size_++;
+        for (int lc = std::min(level, top); lc >= 0; --lc) {
+            auto cand = search_layer(vec, ep, ef_construction_, lc, ctx, dot_fn, nullptr);
+            auto neighbors = select_neighbors_heuristic(vec, cand, M_, ctx, dot_fn);
+            connect(slot, neighbors, lc, ctx, dot_fn);
+            if (!neighbors.empty()) ep = neighbors[0].slot;
+        }
+
+        if (level > top) {
+            std::unique_lock lk(global_mutex_);
+            if (level > max_layer_) {
+                max_layer_ = level;
+                enterpoint_ = slot;
+            }
+        }
     }
 
-    std::vector<std::pair<Slot, float>> search(
-            const float* query,
-            int k,
-            int ef = 64,
-            std::function<bool(Slot)> filter = nullptr) const {
+    // ---- Search ----
+    struct SearchHit {
+        Slot  slot;
+        float dist;     // 1 - cos
+    };
 
-        std::shared_lock<std::shared_mutex> lock(global_mutex_);
+    std::vector<SearchHit> search(const float* query, int ef, int /*topk*/,
+                                  const void* ctx, DotFn dot_fn) const {
+        if (empty()) return {};
 
-        if (enterpoint_ == INVALID_SLOT || size_ == 0) {
-            return {};
+        Slot ep;
+        int top;
+        {
+            std::shared_lock lk(global_mutex_);
+            ep = enterpoint_;
+            top = max_layer_;
         }
 
-        Slot curr_ep = enterpoint_;
-        for (int lc = max_level_; lc > 0; --lc) {
-            curr_ep = search_layer_simple(query, curr_ep, lc);
+        for (int lc = top; lc > 0; --lc) {
+            ep = greedy_descend(ep, query, lc, ctx, dot_fn);
         }
 
-        auto candidates = search_layer(query, curr_ep, ef, 0, filter);
+        // Bottom layer with no slot-level filter; rerank/dedupe happens upstream.
+        auto pool = search_layer(query, ep, ef, 0, ctx, dot_fn, nullptr);
 
-        std::vector<std::pair<Slot, float>> result;
-        result.reserve(std::min(k, (int)candidates.size()));
-
-        auto vec = candidates.top_vector();
-        int count = 0;
-        for (auto it = vec.begin(); it != vec.end() && count < k; ++it, ++count) {
-            result.push_back(*it);
+        // Convert max-heap to sorted vector (ascending distance).
+        std::vector<SearchHit> out;
+        out.reserve(pool.size());
+        while (!pool.empty()) {
+            const auto& c = pool.top();
+            out.push_back({c.slot, c.dist});
+            pool.pop();
         }
-
-        return result;
+        std::sort(out.begin(), out.end(),
+                  [](const SearchHit& a, const SearchHit& b) { return a.dist < b.dist; });
+        return out;
     }
+
+    // Persist neighbors only (vectors are stored elsewhere).
+    void save_meta(std::ofstream& out) const {
+        std::shared_lock lk(global_mutex_);
+        out.write(reinterpret_cast<const char*>(&enterpoint_), sizeof(enterpoint_));
+        out.write(reinterpret_cast<const char*>(&max_layer_), sizeof(max_layer_));
+        out.write(reinterpret_cast<const char*>(&max_elements_), sizeof(max_elements_));
+        out.write(reinterpret_cast<const char*>(&M_), sizeof(M_));
+        out.write(reinterpret_cast<const char*>(&M_max0_), sizeof(M_max0_));
+        out.write(reinterpret_cast<const char*>(&ef_construction_), sizeof(ef_construction_));
+        size_t sz = size_.load(std::memory_order_acquire);
+        out.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+    }
+
+    // (Persistence of full graph is M5; for now we rebuild on load.)
 
     void clear() {
-        std::unique_lock<std::shared_mutex> lock(global_mutex_);
-        nodes_.clear();
-        enterpoint_ = INVALID_SLOT;
-        max_level_ = -1;
-        size_ = 0;
+        std::unique_lock lk(global_mutex_);
+        for (auto& d : layer0_deg_) d.store(0, std::memory_order_relaxed);
+        for (auto& t : node_top_) t.store(-1, std::memory_order_relaxed);
+        for (auto& u : upper_) u.clear();
+        enterpoint_ = kInvalidSlot;
+        max_layer_ = -1;
+        size_.store(0, std::memory_order_release);
     }
 
-    size_t size() const { return size_; }
-    bool empty() const { return size_ == 0; }
-
 private:
-    struct Candidate {
-        Slot slot;
-        float dist;
+    static constexpr size_t kStripeN = 1024;
 
-        bool operator>(const Candidate& other) const { return dist > other.dist; }
-        bool operator<(const Candidate& other) const { return dist < other.dist; }
-    };
+    int sample_level() {
+        std::lock_guard<std::mutex> lk(rng_mutex_);
+        int lvl = level_dist_(rng_);
+        if (lvl < 0) lvl = 0;
+        if (lvl > 16) lvl = 16;
+        return lvl;
+    }
 
-    class SearchResultQueue {
-    public:
-        void push(Slot slot, float dist) {
-            queue_.emplace_back(slot, dist);
+    KVANN_FORCE_INLINE std::mutex& slot_mutex(Slot s) const {
+        return mutex_stripes_[s & (kStripeN - 1)];
+    }
+
+    KVANN_FORCE_INLINE Slot* layer0_neighbors(Slot s) {
+        return layer0_arena_.data() + static_cast<size_t>(s) * static_cast<size_t>(M_max0_);
+    }
+    KVANN_FORCE_INLINE const Slot* layer0_neighbors(Slot s) const {
+        return layer0_arena_.data() + static_cast<size_t>(s) * static_cast<size_t>(M_max0_);
+    }
+
+    KVANN_FORCE_INLINE int neighbors_count(Slot s, int layer) const {
+        if (layer == 0) {
+            return static_cast<int>(layer0_deg_[s].load(std::memory_order_acquire));
         }
+        const auto& u = upper_[s];
+        if (layer - 1 >= static_cast<int>(u.size())) return 0;
+        return static_cast<int>(u[layer - 1].size());
+    }
 
-        std::vector<std::pair<Slot, float>> top_vector() const {
-            auto sorted = queue_;
-            std::sort(sorted.begin(), sorted.end(),
-                [](const auto& a, const auto& b) { return a.second < b.second; });
-            return sorted;
+    // Returns a snapshot of neighbor slots at (s, layer). Single call sites copy
+    // into a small local buffer to avoid holding any lock during distance calls.
+    std::vector<Slot> snapshot_neighbors(Slot s, int layer) const {
+        if (layer == 0) {
+            uint8_t deg = layer0_deg_[s].load(std::memory_order_acquire);
+            std::vector<Slot> out(deg);
+            const Slot* src = layer0_neighbors(s);
+            for (int i = 0; i < deg; ++i) {
+                out[i] = src[i];
+            }
+            return out;
         }
+        // Upper layers: take per-slot lock briefly to copy.
+        std::lock_guard<std::mutex> lk(slot_mutex(s));
+        const auto& u = upper_[s];
+        if (layer - 1 >= static_cast<int>(u.size())) return {};
+        return u[layer - 1];
+    }
 
-        size_t size() const { return queue_.size(); }
-
-    private:
-        std::vector<std::pair<Slot, float>> queue_;
-    };
-
-    Slot search_layer_simple(const float* query, Slot enterpoint, int level) const {
-        Slot curr = enterpoint;
-        float curr_dist = distance(query, vector_data_->get_vector(curr));
-
+    Slot greedy_descend(Slot ep, const float* query, int layer,
+                        const void* ctx, DotFn dot_fn) const {
+        Slot curr = ep;
+        float curr_d = 1.0f - dot_fn(ctx, curr, query);
         bool changed = true;
         while (changed) {
             changed = false;
-            if (curr >= nodes_.size()) break;
-
-            const auto& neighbors = nodes_[curr].neighbors;
-            if (level >= (int)neighbors.size()) continue;
-
-            for (Slot neighbor : neighbors[level]) {
-                if (neighbor == INVALID_SLOT) continue;
-
-                float dist = distance(query, vector_data_->get_vector(neighbor));
-                if (dist < curr_dist) {
-                    curr = neighbor;
-                    curr_dist = dist;
+            auto nbrs = snapshot_neighbors(curr, layer);
+            for (Slot n : nbrs) {
+                float d = 1.0f - dot_fn(ctx, n, query);
+                if (d < curr_d) {
+                    curr_d = d;
+                    curr = n;
                     changed = true;
                 }
             }
         }
-
         return curr;
     }
 
-    SearchResultQueue search_layer(
-            const float* query,
-            Slot enterpoint,
-            int ef,
-            int level,
-            std::function<bool(Slot)> filter = nullptr) const {
+    struct Cand {
+        Slot  slot;
+        float dist;     // smaller = closer
+    };
+    struct CmpFar  { bool operator()(const Cand& a, const Cand& b) const { return a.dist < b.dist; } };  // max-heap on dist
+    struct CmpNear { bool operator()(const Cand& a, const Cand& b) const { return a.dist > b.dist; } };  // min-heap on dist
 
-        SearchResultQueue result;
-        std::priority_queue<Candidate, std::vector<Candidate>, std::greater<Candidate>> candidates;
-        std::unordered_set<Slot> visited;
-        std::priority_queue<Candidate> best;
+    using SlotFilter = bool (*)(const void* ctx, Slot s);
 
-        float enter_dist = distance(query, vector_data_->get_vector(enterpoint));
-        candidates.push({enterpoint, enter_dist});
-        visited.insert(enterpoint);
-        best.push({enterpoint, enter_dist});
+    // Returns the upper-bound max-heap of best ef candidates.
+    std::priority_queue<Cand, std::vector<Cand>, CmpFar>
+    search_layer(const float* query, Slot ep, int ef, int layer,
+                 const void* ctx, DotFn dot_fn, SlotFilter sfilter) const {
+        // Per-thread visited buffer (epoch-tagged) — zero-cost reuse.
+        auto& vp = visited_pool();
+        if (vp.tags.size() < max_elements_) {
+            vp.tags.assign(max_elements_, 0);
+            vp.epoch = 0;
+        }
+        uint32_t epoch = ++vp.epoch;
+        if (KVANN_UNLIKELY(epoch == 0)) {
+            std::fill(vp.tags.begin(), vp.tags.end(), 0);
+            epoch = ++vp.epoch;
+        }
+        auto try_visit = [&](Slot s) -> bool {
+            if (vp.tags[s] == epoch) return false;
+            vp.tags[s] = epoch;
+            return true;
+        };
 
-        while (!candidates.empty()) {
-            auto curr = candidates.top();
-            candidates.pop();
+        std::priority_queue<Cand, std::vector<Cand>, CmpNear> frontier;
+        std::priority_queue<Cand, std::vector<Cand>, CmpFar>  best;
 
-            if (!best.empty() && curr.dist > best.top().dist) {
-                break;
-            }
+        float ed = 1.0f - dot_fn(ctx, ep, query);
+        frontier.push({ep, ed});
+        best.push({ep, ed});
+        try_visit(ep);
 
-            if (curr.slot >= nodes_.size()) continue;
+        while (!frontier.empty()) {
+            Cand c = frontier.top();
+            if (!best.empty() && c.dist > best.top().dist) break;
+            frontier.pop();
 
-            const auto& neighbors = nodes_[curr.slot].neighbors;
-            if (level >= (int)neighbors.size()) continue;
-
-            for (Slot neighbor : neighbors[level]) {
-                if (neighbor == INVALID_SLOT || visited.count(neighbor)) continue;
-
-                visited.insert(neighbor);
-                float dist = distance(query, vector_data_->get_vector(neighbor));
-
-                if (filter && !filter(neighbor)) continue;
-
-                if (best.size() < (size_t)ef || dist < best.top().dist) {
-                    candidates.push({neighbor, dist});
-                    best.push({neighbor, dist});
-                    if (best.size() > (size_t)ef) {
-                        best.pop();
-                    }
+            auto nbrs = snapshot_neighbors(c.slot, layer);
+            for (Slot n : nbrs) {
+                if (!try_visit(n)) continue;
+                float d = 1.0f - dot_fn(ctx, n, query);
+                if (sfilter && !sfilter(ctx, n)) {
+                    // visited but not eligible — still don't traverse from it
+                    continue;
+                }
+                if (static_cast<int>(best.size()) < ef || d < best.top().dist) {
+                    frontier.push({n, d});
+                    best.push({n, d});
+                    if (static_cast<int>(best.size()) > ef) best.pop();
                 }
             }
         }
-
-        while (!best.empty()) {
-            auto c = best.top();
-            best.pop();
-            result.push(c.slot, c.dist);
-        }
-
-        return result;
+        return best;
     }
 
-    std::vector<Slot> select_neighbors(const float* /* query */,
-                                       const SearchResultQueue& candidates,
-                                       int M) const {
-        auto vec = candidates.top_vector();
-        std::vector<Slot> result;
-        result.reserve(std::min((size_t)M, vec.size()));
-        for (size_t i = 0; i < vec.size() && i < (size_t)M; ++i) {
-            result.push_back(vec[i].first);
-        }
-        return result;
+    // Neighbor selection — pick M closest. (Pairwise diversity heuristic
+    // requires slot->vec ptr access via DotFn which currently only takes a
+    // query buffer; revisit when DotFn is generalized.)
+    std::vector<Cand> select_neighbors_heuristic(
+            const float* /*query*/,
+            std::priority_queue<Cand, std::vector<Cand>, CmpFar> cand,
+            int M, const void* /*ctx*/, DotFn /*dot_fn*/) const {
+        std::vector<Cand> sorted;
+        sorted.reserve(cand.size());
+        while (!cand.empty()) { sorted.push_back(cand.top()); cand.pop(); }
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const Cand& a, const Cand& b) { return a.dist < b.dist; });
+        if (static_cast<int>(sorted.size()) > M) sorted.resize(static_cast<size_t>(M));
+        return sorted;
     }
 
-    void shrink_connections(Slot slot, int level) {
-        if (slot >= nodes_.size()) return;
-
-        auto& neighbors = nodes_[slot].neighbors[level];
-        int M_max = (level == 0) ? M_max_ * 2 : M_max_;
-
-        if ((int)neighbors.size() > M_max) {
-            neighbors.resize(M_max);
+    void connect(Slot src, const std::vector<Cand>& neighbors, int layer,
+                 const void* ctx, DotFn dot_fn) {
+        // Add src->n on this layer.
+        for (const Cand& nc : neighbors) {
+            insert_neighbor(src, nc.slot, layer, ctx, dot_fn);
+            insert_neighbor(nc.slot, src, layer, ctx, dot_fn);
         }
     }
 
-    float distance(const float* a, const float* b) const {
-        float sim = cosine_similarity(a, b, dim_);
-        return 1.0f - sim;
+    void insert_neighbor(Slot s, Slot n, int layer,
+                         const void* /*ctx*/, DotFn /*dot_fn*/) {
+        if (s == n) return;
+        std::lock_guard<std::mutex> lk(slot_mutex(s));
+        if (layer == 0) {
+            uint8_t deg = layer0_deg_[s].load(std::memory_order_relaxed);
+            Slot* arr = layer0_neighbors(s);
+            for (int i = 0; i < deg; ++i) if (arr[i] == n) return;
+            if (deg < M_max0_) {
+                arr[deg] = n;
+                layer0_deg_[s].store(static_cast<uint8_t>(deg + 1),
+                                     std::memory_order_release);
+            } else {
+                // Cap reached — replace the most-recent slot (FIFO-ish).
+                // True heuristic eviction is a follow-up (needs slot->vec access).
+                arr[deg - 1] = n;
+            }
+        } else {
+            int li = layer - 1;
+            auto& u = upper_[s];
+            int top = node_top_[s].load(std::memory_order_acquire);
+            if (top < layer) return;
+            if (li >= static_cast<int>(u.size())) {
+                u.resize(static_cast<size_t>(layer));
+            }
+            auto& vec = u[li];
+            for (Slot existing : vec) if (existing == n) return;
+            if (static_cast<int>(vec.size()) < M_) {
+                vec.push_back(n);
+            } else {
+                vec.back() = n;
+            }
+        }
     }
 
-    int random_level() {
-        int level = level_gen_(rng_);
-        if (level < 0) level = 0;
-        int max_possible_level = 16;
-        if (level > max_possible_level) level = max_possible_level;
-        return level;
+    struct VisitedTLS {
+        std::vector<uint32_t> tags;
+        uint32_t epoch = 0;
+    };
+    static VisitedTLS& visited_pool() {
+        thread_local VisitedTLS v;
+        return v;
     }
 
     size_t dim_;
     size_t max_elements_;
     int M_;
-    int M_max_;
+    int M_max0_;
     int ef_construction_;
 
     Slot enterpoint_;
-    int max_level_;
-    size_t size_;
-
-    std::vector<HNSWNode> nodes_;
-    const VectorStorage* vector_data_;
+    int  max_layer_;
+    std::atomic<size_t> size_;
 
     mutable std::shared_mutex global_mutex_;
+    mutable std::vector<std::mutex> mutex_stripes_;
 
-    std::mt19937 rng_;
-    std::geometric_distribution<int> level_gen_;
+    std::vector<Slot> layer0_arena_;          // size = max_elements * M_max0_
+    std::vector<std::atomic<uint8_t>> layer0_deg_;
+    std::vector<std::atomic<int8_t>> node_top_;
+    std::vector<std::vector<std::vector<Slot>>> upper_;  // upper_[slot][layer-1]
+
+    std::mt19937_64 rng_;
+    std::geometric_distribution<int> level_dist_;
+    std::mutex rng_mutex_;
 };
 
 // ============================================================================
-// Index 实现
+// DeltaSet
 // ============================================================================
+class DeltaSet {
+public:
+    explicit DeltaSet(size_t cap) : alive_(cap) {
+        for (auto& a : alive_) a.store(0, std::memory_order_relaxed);
+    }
 
-struct DeltaEntry {
-    Slot slot;
-    uint64_t epoch;
+    KVANN_FORCE_INLINE bool is_alive(Slot s) const {
+        return alive_[s].load(std::memory_order_acquire) != 0;
+    }
+
+    void mark_alive(Slot s) {
+        std::lock_guard lk(list_mutex_);
+        if (alive_[s].load(std::memory_order_relaxed) == 0) {
+            alive_[s].store(1, std::memory_order_release);
+            members_.insert(s);
+        }
+    }
+
+    void mark_dead(Slot s) {
+        std::lock_guard lk(list_mutex_);
+        if (alive_[s].load(std::memory_order_relaxed) != 0) {
+            alive_[s].store(0, std::memory_order_release);
+            members_.erase(s);
+        }
+    }
+
+    size_t size() const {
+        std::lock_guard lk(list_mutex_);
+        return members_.size();
+    }
+
+    std::vector<Slot> snapshot() const {
+        std::lock_guard lk(list_mutex_);
+        return std::vector<Slot>(members_.begin(), members_.end());
+    }
+
+    void clear() {
+        std::lock_guard lk(list_mutex_);
+        for (Slot s : members_) alive_[s].store(0, std::memory_order_release);
+        members_.clear();
+    }
+
+private:
+    mutable std::mutex list_mutex_;
+    std::vector<std::atomic<uint8_t>> alive_;
+    std::unordered_set<Slot> members_;
 };
 
+} // anonymous namespace
+
+// ============================================================================
+// Index::Impl
+// ============================================================================
 struct Index::Impl {
-    Impl(size_t dim, const IndexConfig& config)
-        : dim_(dim),
-          config_(config),
-          storage_(dim, config.max_elements, config.storage_block_size),
-          key_manager_(config.lock_stripes),
-          base_index_(dim, config.max_elements, config.hnsw_M, config.hnsw_ef_construction),
-          delta_index_(dim, config.max_elements, config.hnsw_M, config.hnsw_ef_construction),
-          delta_maps_(config.lock_stripes ? config.lock_stripes : 1),
-          delta_mutexes_(config.lock_stripes ? config.lock_stripes : 1),
-          delta_size_(0),
-          delta_hnsw_ready_(false),
-          delta_epoch_(0),
+    Impl(IndexConfig cfg)
+        : config_(std::move(cfg)),
+          storage_(config_.dim, config_.max_elements, config_.storage_block_size),
+          slot_key_(config_.max_elements),
+          key_dir_(config_.lock_stripes),
+          base_graph_(std::make_unique<HnswGraph>(
+              config_.dim, config_.max_elements,
+              config_.hnsw_M, config_.hnsw_M_max0, config_.hnsw_ef_construction)),
+          delta_graph_(std::make_unique<HnswGraph>(
+              config_.dim, config_.max_elements,
+              config_.hnsw_M, config_.hnsw_M_max0, config_.hnsw_ef_construction)),
+          delta_(config_.max_elements),
+          next_slot_(0),
           rebuild_running_(false) {
-        base_index_.set_vector_source(&storage_);
-        delta_index_.set_vector_source(&storage_);
+        if (config_.dim == 0) {
+            throw std::invalid_argument("kvann: IndexConfig::dim must be > 0");
+        }
+        if (config_.max_elements == 0) {
+            throw std::invalid_argument("kvann: IndexConfig::max_elements must be > 0");
+        }
+        if (config_.lock_stripes == 0) config_.lock_stripes = 1;
     }
 
     ~Impl() {
-        if (rebuild_thread_.joinable()) {
-            rebuild_thread_.join();
-        }
+        if (rebuild_thread_.joinable()) rebuild_thread_.join();
     }
 
-    bool put_with_data(Key key, const float* vector, const void* user_data, size_t user_data_len) {
-        Vector normalized_vec(vector, vector + dim_);
-        normalize_vector(normalized_vec.data(), dim_);
+    // ------- ctx adapter for HnswGraph -------
+    static float dot_via_storage(const void* ctx, Slot s, const float* query) {
+        const Impl* self = static_cast<const Impl*>(ctx);
+        return self->storage_.dot_with(s, query);
+    }
 
-        auto existing = key_manager_.get_meta(key);
+    // ------- single-key ops -------
+    Status put(Key key, const float* vector, const void* payload, size_t payload_len) {
+        if (vector == nullptr) return Status::InvalidArgument("vector is null");
 
-        if (existing && !existing->tombstone) {
-            Slot slot = existing->slot;
-            storage_.set_vector(slot, normalized_vec.data());
+        // Normalize into a stack/heap buffer.
+        std::vector<float> norm(config_.dim);
+        std::memcpy(norm.data(), vector, config_.dim * sizeof(float));
+        simd::normalize_f32(norm.data(), config_.dim);
 
-            VectorMeta meta = *existing;
-            meta.version++;
-            if (user_data && user_data_len > 0) {
-                const uint8_t* data_ptr = static_cast<const uint8_t*>(user_data);
-                meta.user_data.assign(data_ptr, data_ptr + user_data_len);
+        Slot slot = kInvalidSlot;
+        bool is_new = false;
+
+        Status st = key_dir_.with_write(key, [&](KeyEntry& e, bool inserted) -> Status {
+            if (inserted) {
+                Slot s = next_slot_.fetch_add(1, std::memory_order_acq_rel);
+                if (s >= static_cast<Slot>(config_.max_elements)) {
+                    // Slot is permanently leaked; concurrent fetch_add prevents
+                    // a safe rollback. Acceptable: callers must respect cap.
+                    return Status::Full();
+                }
+                e.slot = s;
+                e.version = 1;
+                is_new = true;
             } else {
-                meta.user_data.clear();
+                e.version++;
             }
-            key_manager_.update_meta(key, meta);
-            delta_upsert(key, slot);
-            maybe_add_delta_hnsw(slot);
-
-            return true;
-        }
-
-        Slot slot;
-        if (existing) {
-            slot = existing->slot;
-        } else {
-            slot = storage_.allocate_slot();
-        }
-
-        storage_.set_vector(slot, normalized_vec.data());
-
-        VectorMeta meta(slot);
-        if (user_data && user_data_len > 0) {
-            const uint8_t* data_ptr = static_cast<const uint8_t*>(user_data);
-            meta.user_data.assign(data_ptr, data_ptr + user_data_len);
-        }
-        key_manager_.put(key, meta);
-        delta_upsert(key, slot);
-        maybe_add_delta_hnsw(slot);
-
-        return true;
-    }
-
-    bool del(Key key) {
-        if (!key_manager_.exists(key)) {
-            return false;
-        }
-
-        key_manager_.del(key);
-        delta_erase(key);
-        return true;
-    }
-
-    bool exists(Key key) const {
-        auto meta = key_manager_.get_meta(key);
-        return meta.has_value() && !meta->tombstone;
-    }
-
-    std::vector<uint8_t> get_user_data(Key key) const {
-        auto meta = key_manager_.get_meta(key);
-        if (meta && !meta->tombstone) {
-            return meta->user_data;
-        }
-        return {};
-    }
-
-    std::vector<SearchResult> search(const float* query, int topk) {
-        Vector normalized_query(query, query + dim_);
-        normalize_vector(normalized_query.data(), dim_);
-
-        std::vector<std::pair<Slot, float>> candidates;
-
-        {
-            std::shared_lock<std::shared_mutex> lock(base_mutex_);
-            if (!base_index_.empty()) {
-                auto base_candidates = base_index_.search(
-                    normalized_query.data(),
-                    topk * 2,
-                    config_.hnsw_ef_search
-                );
-                candidates.insert(candidates.end(), base_candidates.begin(), base_candidates.end());
+            if (payload && payload_len > 0) {
+                const auto* p = static_cast<const uint8_t*>(payload);
+                e.payload.assign(p, p + payload_len);
+            } else if (payload == nullptr) {
+                // unspecified -> keep existing payload on update; clear on insert
+                if (inserted) e.payload.clear();
+            } else {
+                e.payload.clear();
             }
-        }
+            slot = e.slot;
+            return Status::Ok();
+        });
+        if (!st.ok()) return st;
 
-        if (!delta_hnsw_ready_.load() && delta_size_.load() > config_.delta_hnsw_threshold) {
-            rebuild_delta_hnsw_if_needed();
-        }
+        storage_.set_vector(slot, norm.data());
+        slot_key_.set(slot, key);
 
-        if (should_use_delta_hnsw()) {
-            auto delta_candidates = delta_index_.search(
-                normalized_query.data(),
-                topk * 2,
-                config_.hnsw_ef_search,
-                [this](Slot slot) { return delta_slot_live(slot); }
-            );
-            candidates.insert(candidates.end(), delta_candidates.begin(), delta_candidates.end());
-        } else {
-            search_delta_brute_force(normalized_query.data(), topk * 2, candidates);
-        }
+        // Add to delta graph (always until rebuild moves it to base).
+        delta_.mark_alive(slot);
 
-        return rerank(normalized_query.data(), candidates, topk);
+        if (is_new) live_count_.fetch_add(1, std::memory_order_acq_rel);
+
+        maybe_extend_delta_hnsw(slot, norm.data());
+        return Status::Ok();
     }
 
-    void rebuild() {
-        if (rebuild_running_.load()) {
+    void maybe_extend_delta_hnsw(Slot just_added, const float* vec) {
+        if (delta_hnsw_active_.load(std::memory_order_acquire)) {
+            delta_graph_->add(just_added, vec, this, &Impl::dot_via_storage);
             return;
         }
+        if (delta_.size() <= config_.delta_hnsw_threshold) return;
 
-        rebuild_running_ = true;
-
-        if (rebuild_thread_.joinable()) {
-            rebuild_thread_.join();
+        std::lock_guard<std::mutex> lk(delta_hnsw_build_mutex_);
+        if (delta_hnsw_active_.load(std::memory_order_acquire)) {
+            delta_graph_->add(just_added, vec, this, &Impl::dot_via_storage);
+            return;
         }
-
-        rebuild_thread_ = std::thread([this]() { do_rebuild(); });
+        // Promotion: backfill ALL current delta members into the HNSW.
+        auto members = delta_.snapshot();
+        std::vector<float> tmp(config_.dim);
+        for (Slot m : members) {
+            const float* src = (m == just_added) ? vec : nullptr;
+            if (src) {
+                delta_graph_->add(m, src, this, &Impl::dot_via_storage);
+            } else {
+                storage_.copy_vector(m, tmp.data());
+                delta_graph_->add(m, tmp.data(), this, &Impl::dot_via_storage);
+            }
+        }
+        delta_hnsw_active_.store(true, std::memory_order_release);
     }
 
-    void wait_rebuild() {
-        if (rebuild_thread_.joinable()) {
-            rebuild_thread_.join();
-        }
+    Status del(Key key) {
+        KeyEntry e;
+        if (!key_dir_.find(key, e)) return Status::NotFound();
+        Slot slot = e.slot;
+        if (!key_dir_.erase(key)) return Status::NotFound();
+        slot_key_.clear(slot);
+        delta_.mark_dead(slot);
+        live_count_.fetch_sub(1, std::memory_order_acq_rel);
+        return Status::Ok();
     }
 
-    IndexStats stats() const {
-        IndexStats s;
+    bool exists(Key key) const { return key_dir_.contains(key); }
 
-        size_t total, live, tombstones;
-        key_manager_.get_stats(total, live, tombstones);
+    Status get_payload(Key key, std::vector<uint8_t>& out) const {
+        KeyEntry e;
+        if (!key_dir_.find(key, e)) return Status::NotFound();
+        out = std::move(e.payload);
+        return Status::Ok();
+    }
 
-        s.total_vectors = total;
-        s.live_vectors = live;
-        s.tombstone_count = tombstones;
+    // ------- search -------
+    std::vector<SearchResult> search(const float* query, const SearchParams& params) const {
+        if (query == nullptr) return {};
+        int topk = std::max(1, params.topk);
+        int ef = params.ef > 0 ? params.ef : config_.hnsw_ef_search;
+
+        std::vector<float> q(config_.dim);
+        std::memcpy(q.data(), query, config_.dim * sizeof(float));
+        simd::normalize_f32(q.data(), config_.dim);
+
+        // Collect candidates from base + delta.
+        // Hold shared lock while we touch base_graph_ — rebuild swaps the
+        // unique_ptr under unique_lock at the end of do_rebuild().
+        std::vector<HnswGraph::SearchHit> base_hits;
         {
-            std::shared_lock<std::shared_mutex> lock(base_mutex_);
-            s.base_count = base_index_.size();
-        }
-        s.delta_count = delta_size_.load();
-
-        s.tombstone_ratio = total > 0 ? (float)tombstones / total : 0;
-        s.delta_ratio = live > 0 ? (float)s.delta_count / live : 0;
-        s.dim = dim_;
-
-        return s;
-    }
-
-    void save(const std::string& path) const {
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-            throw std::runtime_error("Cannot open file for writing: " + path);
+            std::shared_lock lk(base_swap_mutex_);
+            if (!base_graph_->empty()) {
+                base_hits = base_graph_->search(q.data(), ef, topk * 2,
+                                                this, &Impl::dot_via_storage);
+            }
         }
 
-        const char magic[8] = {'K','V','A','N','N','0','1','\0'};
-        uint32_t version = 1;
-        uint32_t reserved = 0;
-        out.write(magic, sizeof(magic));
-        out.write(reinterpret_cast<const char*>(&version), sizeof(version));
-        out.write(reinterpret_cast<const char*>(&reserved), sizeof(reserved));
-
-        size_t dim = dim_;
-        size_t max_elements = config_.max_elements;
-        size_t block_size = config_.storage_block_size;
-        out.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
-        out.write(reinterpret_cast<const char*>(&max_elements), sizeof(max_elements));
-        out.write(reinterpret_cast<const char*>(&block_size), sizeof(block_size));
-
-        key_manager_.save(out);
-        storage_.save(out);
-
-        out.close();
-    }
-
-    void load_from_stream(std::ifstream& in) {
-        key_manager_.load(in);
-        storage_.load(in);
-        rebuild_base_from_kv();
-        rebuild_delta_hnsw_if_needed();
-    }
-
-private:
-    size_t delta_stripe(Key key) const {
-        size_t stripes = delta_maps_.size();
-        return stripes ? (key % stripes) : 0;
-    }
-
-    void delta_upsert(Key key, Slot slot) {
-        size_t idx = delta_stripe(key);
-        std::unique_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
-        auto& map = delta_maps_[idx];
-        auto it = map.find(key);
-        if (it == map.end()) {
-            delta_size_.fetch_add(1);
-        }
-        map[key] = {slot, delta_epoch_.fetch_add(1) + 1};
-    }
-
-    void delta_erase(Key key) {
-        size_t idx = delta_stripe(key);
-        std::unique_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
-        auto& map = delta_maps_[idx];
-        auto it = map.find(key);
-        if (it != map.end()) {
-            map.erase(it);
-            delta_size_.fetch_sub(1);
-        }
-    }
-
-    bool delta_contains_key(Key key) const {
-        size_t idx = delta_stripe(key);
-        std::shared_lock<std::shared_mutex> lock(delta_mutexes_[idx]);
-        const auto& map = delta_maps_[idx];
-        return map.find(key) != map.end();
-    }
-
-    bool delta_slot_live(Slot slot) const {
-        auto key_opt = key_manager_.get_key_by_slot(slot);
-        if (!key_opt) return false;
-        return delta_contains_key(*key_opt);
-    }
-
-    void clear_delta_all() {
-        for (size_t i = 0; i < delta_maps_.size(); ++i) {
-            std::unique_lock<std::shared_mutex> lock(delta_mutexes_[i]);
-            delta_maps_[i].clear();
-        }
-        delta_size_.store(0);
-        {
-            std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
-            delta_index_.clear();
-            delta_hnsw_slots_.clear();
-            delta_hnsw_ready_.store(false);
-        }
-    }
-
-    void clear_delta_up_to_epoch(uint64_t epoch) {
-        for (size_t i = 0; i < delta_maps_.size(); ++i) {
-            std::unique_lock<std::shared_mutex> lock(delta_mutexes_[i]);
-            auto& map = delta_maps_[i];
-            for (auto it = map.begin(); it != map.end();) {
-                if (it->second.epoch <= epoch) {
-                    it = map.erase(it);
-                    delta_size_.fetch_sub(1);
-                } else {
-                    ++it;
+        std::vector<HnswGraph::SearchHit> delta_hits;
+        size_t dsz = delta_.size();
+        if (dsz > 0) {
+            if (delta_hnsw_active_.load(std::memory_order_acquire)
+                && !delta_graph_->empty()) {
+                delta_hits = delta_graph_->search(q.data(), ef, topk * 2,
+                                                  this, &Impl::dot_via_storage);
+            } else {
+                // Brute-force over delta members.
+                auto members = delta_.snapshot();
+                delta_hits.reserve(members.size());
+                for (Slot s : members) {
+                    float d = 1.0f - storage_.dot_with(s, q.data());
+                    delta_hits.push_back({s, d});
                 }
             }
         }
-        if (delta_size_.load() <= config_.delta_bruteforce_limit) {
-            std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
-            delta_index_.clear();
-            delta_hnsw_slots_.clear();
-            delta_hnsw_ready_.store(false);
-        }
-    }
 
-    bool should_use_delta_hnsw() const {
-        if (delta_size_.load() <= config_.delta_bruteforce_limit) {
-            return false;
-        }
-        return delta_hnsw_ready_.load() || delta_size_.load() > config_.delta_hnsw_threshold;
-    }
+        // Merge + dedupe + alive-check + rerank with exact cosine on storage.
+        // alive-check uses slot_key_ (kInvalidKey == dead).
+        std::vector<SearchResult> out;
+        out.reserve(static_cast<size_t>(topk));
+        std::vector<std::pair<Slot, float>> merged;
+        merged.reserve(base_hits.size() + delta_hits.size());
+        for (const auto& h : base_hits)  merged.emplace_back(h.slot, h.dist);
+        for (const auto& h : delta_hits) merged.emplace_back(h.slot, h.dist);
 
-    void rebuild_delta_hnsw_if_needed() {
-        if (delta_size_.load() <= config_.delta_hnsw_threshold) {
-            return;
-        }
-        std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
-        delta_index_.clear();
-        delta_hnsw_slots_.clear();
-        for (size_t i = 0; i < delta_maps_.size(); ++i) {
-            std::shared_lock<std::shared_mutex> map_lock(delta_mutexes_[i]);
-            for (const auto& [key, entry] : delta_maps_[i]) {
-                delta_index_.add(entry.slot);
-                delta_hnsw_slots_.insert(entry.slot);
-            }
-        }
-        delta_hnsw_ready_.store(true);
-    }
+        // Dedupe by slot (keep the smaller dist).
+        std::sort(merged.begin(), merged.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first || (a.first == b.first && a.second < b.second);
+                  });
+        merged.erase(std::unique(merged.begin(), merged.end(),
+                                 [](const auto& a, const auto& b) { return a.first == b.first; }),
+                     merged.end());
 
-    void maybe_add_delta_hnsw(Slot slot) {
-        if (!delta_hnsw_ready_.load()) {
-            if (delta_size_.load() > config_.delta_hnsw_threshold) {
-                rebuild_delta_hnsw_if_needed();
-            }
-            return;
+        // Re-score with exact cosine + apply user filter + alive check.
+        std::vector<SearchResult> scored;
+        scored.reserve(merged.size());
+        for (auto& [slot, _] : merged) {
+            Key k = slot_key_.get(slot);
+            if (k == kInvalidKey) continue;
+            if (params.filter && !params.filter(k)) continue;
+            float sim = storage_.dot_with(slot, q.data());
+            scored.emplace_back(k, sim);
         }
-        std::unique_lock<std::mutex> lock(delta_hnsw_mutex_);
-        if (delta_hnsw_slots_.insert(slot).second) {
-            delta_index_.add(slot);
+
+        // top-k by score desc.
+        if (static_cast<int>(scored.size()) > topk) {
+            std::partial_sort(scored.begin(), scored.begin() + topk, scored.end(),
+                              [](const SearchResult& a, const SearchResult& b) {
+                                  return a.score > b.score;
+                              });
+            scored.resize(static_cast<size_t>(topk));
+        } else {
+            std::sort(scored.begin(), scored.end(),
+                      [](const SearchResult& a, const SearchResult& b) {
+                          return a.score > b.score;
+                      });
         }
-    }
 
-    void search_delta_brute_force(const float* query, int /* topk */,
-                                  std::vector<std::pair<Slot, float>>& results) const {
-        for (size_t i = 0; i < delta_maps_.size(); ++i) {
-            std::shared_lock<std::shared_mutex> lock(delta_mutexes_[i]);
-            for (const auto& [key, entry] : delta_maps_[i]) {
-                Slot slot = entry.slot;
-                const float* vec = storage_.get_vector(slot);
-                float sim = cosine_similarity(query, vec, dim_);
-                results.emplace_back(slot, 1.0f - sim);
-            }
-        }
-    }
-
-    std::vector<SearchResult> rerank(const float* query,
-                                     const std::vector<std::pair<Slot, float>>& candidates,
-                                     int topk) {
-        std::unordered_set<Slot> seen;
-        std::vector<std::pair<Slot, float>> unique_candidates;
-
-        for (const auto& [slot, _] : candidates) {
-            if (seen.insert(slot).second) {
-                const float* vec = storage_.get_vector(slot);
-                float sim = cosine_similarity(query, vec, dim_);
-                unique_candidates.emplace_back(slot, sim);
+        if (params.include_payload) {
+            for (auto& r : scored) {
+                KeyEntry e;
+                if (key_dir_.find(r.key, e)) r.payload = std::move(e.payload);
             }
         }
 
-        std::partial_sort(unique_candidates.begin(),
-                          unique_candidates.begin() + std::min((size_t)topk, unique_candidates.size()),
-                          unique_candidates.end(),
-                          [](const auto& a, const auto& b) { return a.second > b.second; });
+        return scored;
+    }
 
-        std::vector<SearchResult> result;
-        result.reserve(std::min((size_t)topk, unique_candidates.size()));
-
-        for (size_t i = 0; i < unique_candidates.size() && i < (size_t)topk; ++i) {
-            Slot slot = unique_candidates[i].first;
-            float score = unique_candidates[i].second;
-            auto key_opt = key_manager_.get_key_by_slot(slot);
-            if (!key_opt) continue;
-            Key key = *key_opt;
-            result.emplace_back(key, score);
+    // ------- batch -------
+    Status put_batch(const Key* keys, const float* vectors, size_t n, size_t* first_err) {
+        Status agg = Status::Ok();
+        for (size_t i = 0; i < n; ++i) {
+            Status s = put(keys[i], vectors + i * config_.dim, nullptr, 0);
+            if (!s.ok() && agg.ok()) {
+                agg = s;
+                if (first_err) *first_err = i;
+            }
         }
+        return agg;
+    }
 
-        return result;
+    std::vector<std::vector<SearchResult>>
+    search_batch(const float* queries, size_t n, const SearchParams& params) const {
+        std::vector<std::vector<SearchResult>> out(n);
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = search(queries + i * config_.dim, params);
+        }
+        return out;
+    }
+
+    // ------- rebuild -------
+    Status rebuild_async() {
+        bool expected = false;
+        if (!rebuild_running_.compare_exchange_strong(expected, true)) {
+            return Status::AlreadyExists("rebuild already running");
+        }
+        if (rebuild_thread_.joinable()) rebuild_thread_.join();
+        rebuild_thread_ = std::thread([this]() { do_rebuild(); });
+        return Status::Ok();
+    }
+
+    Status rebuild() {
+        Status s = rebuild_async();
+        if (!s.ok() && s.code() != StatusCode::kAlreadyExists) return s;
+        wait_rebuild();
+        return Status::Ok();
+    }
+
+    void wait_rebuild() const {
+        if (rebuild_thread_.joinable()) {
+            const_cast<std::thread&>(rebuild_thread_).join();
+        }
     }
 
     void do_rebuild() {
-        std::cout << "[rebuild] Starting..." << std::endl;
+        emit_log(config_, "info", "rebuild starting");
+        KVANN_LOG_INFO("rebuild starting");
 
-        auto live_keys = key_manager_.get_all_live();
-
-        uint64_t start_epoch = delta_epoch_.load();
-        HNSWIndex new_base(dim_, config_.max_elements, config_.hnsw_M, config_.hnsw_ef_construction);
-        new_base.set_vector_source(&storage_);
-
-        for (const auto& [key, slot] : live_keys) {
-            new_base.add(slot);
-        }
-
+        // 1. Snapshot live (key, slot, vector) under stripe read locks.
+        struct Snap { Key key; Slot slot; };
+        std::vector<Snap> snap;
+        std::vector<float> snap_vecs;
         {
-            std::unique_lock<std::shared_mutex> lock(base_mutex_);
-            base_index_ = std::move(new_base);
+            auto entries = key_dir_.snapshot_all();
+            snap.reserve(entries.size());
+            snap_vecs.resize(entries.size() * config_.dim);
+            size_t i = 0;
+            for (auto& [k, e] : entries) {
+                snap.push_back({k, e.slot});
+                storage_.copy_vector(e.slot, snap_vecs.data() + i * config_.dim);
+                ++i;
+            }
         }
-        clear_delta_up_to_epoch(start_epoch);
 
-        rebuild_running_ = false;
-        std::cout << "[rebuild] Done. Base size: " << base_index_.size() << std::endl;
+        // 2. Build new base HNSW from snapshot. Vectors are already in storage_,
+        //    so dot_fn = storage_.dot_with. Concurrent updates to those slots are
+        //    protected by the seqlock (search will retry on torn reads).
+        auto new_base = std::make_unique<HnswGraph>(
+            config_.dim, config_.max_elements,
+            config_.hnsw_M, config_.hnsw_M_max0, config_.hnsw_ef_construction);
+        for (size_t i = 0; i < snap.size(); ++i) {
+            new_base->add(snap[i].slot, snap_vecs.data() + i * config_.dim,
+                          this, &Impl::dot_via_storage);
+        }
+
+        // 3. Atomic swap.
+        {
+            std::unique_lock lk(base_swap_mutex_);
+            base_graph_ = std::move(new_base);
+        }
+
+        // 4. Drain delta of entries that are now in base.
+        std::unordered_set<Slot> base_slots;
+        base_slots.reserve(snap.size());
+        for (auto& s : snap) base_slots.insert(s.slot);
+        auto members = delta_.snapshot();
+        for (Slot m : members) {
+            if (base_slots.count(m)) delta_.mark_dead(m);
+        }
+        {
+            std::lock_guard<std::mutex> lk(delta_hnsw_build_mutex_);
+            delta_graph_->clear();
+            delta_hnsw_active_.store(false, std::memory_order_release);
+        }
+
+        rebuild_running_.store(false, std::memory_order_release);
+        emit_log(config_, "info", "rebuild done");
+        KVANN_LOG_INFO("rebuild done");
     }
 
-    void rebuild_base_from_kv() {
-        auto live_keys = key_manager_.get_all_live();
-        std::unique_lock<std::shared_mutex> lock(base_mutex_);
-        base_index_.clear();
-        for (const auto& [key, slot] : live_keys) {
-            base_index_.add(slot);
+    // ------- stats -------
+    IndexStats stats() const {
+        IndexStats s;
+        s.dim = config_.dim;
+        size_t total = static_cast<size_t>(next_slot_.load(std::memory_order_acquire));
+        size_t alive = live_count_.load(std::memory_order_acquire);
+        s.total_keys = total;
+        s.live_keys = alive;
+        s.tombstone_count = total > alive ? total - alive : 0;
+        s.tombstone_ratio = total > 0 ? static_cast<float>(s.tombstone_count) / total : 0.0f;
+        {
+            std::shared_lock lk(base_swap_mutex_);
+            s.base_count = base_graph_->size();
         }
-        clear_delta_all();
+        s.delta_count = delta_.size();
+        s.delta_ratio = alive > 0 ? static_cast<float>(s.delta_count) / alive : 0.0f;
+        s.simd_backend = simd_backend();
+        return s;
     }
 
-private:
-    size_t dim_;
+    const IndexConfig& config() const { return config_; }
+
+    // ------- persistence -------
+    Status save(const std::string& path) const {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return Status::Io("cannot open: " + path);
+
+        const char magic[8] = {'K','V','A','N','N','0','2','\0'};
+        uint32_t fmt_version = 2;
+        uint32_t reserved = 0;
+        out.write(magic, sizeof(magic));
+        out.write(reinterpret_cast<const char*>(&fmt_version), sizeof(fmt_version));
+        out.write(reinterpret_cast<const char*>(&reserved), sizeof(reserved));
+
+        // Config
+        out.write(reinterpret_cast<const char*>(&config_.dim), sizeof(size_t));
+        out.write(reinterpret_cast<const char*>(&config_.max_elements), sizeof(size_t));
+        out.write(reinterpret_cast<const char*>(&config_.storage_block_size), sizeof(size_t));
+
+        // Snapshot live keys + payloads + vectors (slot order).
+        auto entries = key_dir_.snapshot_all();
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.second.slot < b.second.slot; });
+
+        size_t n = entries.size();
+        out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+
+        std::vector<Slot> slots;
+        slots.reserve(n);
+        for (auto& [k, e] : entries) {
+            out.write(reinterpret_cast<const char*>(&k), sizeof(k));
+            out.write(reinterpret_cast<const char*>(&e.slot), sizeof(e.slot));
+            out.write(reinterpret_cast<const char*>(&e.version), sizeof(e.version));
+            size_t pl = e.payload.size();
+            out.write(reinterpret_cast<const char*>(&pl), sizeof(pl));
+            if (pl > 0) {
+                out.write(reinterpret_cast<const char*>(e.payload.data()), pl);
+            }
+            slots.push_back(e.slot);
+        }
+
+        storage_.save_vectors(out, slots);
+        out.flush();
+        if (!out) return Status::Io("write failed");
+        return Status::Ok();
+    }
+
+    static std::unique_ptr<Index> load(const std::string& path);
+
+    void load_from_stream(std::ifstream& in) {
+        size_t n;
+        in.read(reinterpret_cast<char*>(&n), sizeof(n));
+
+        std::vector<Slot> slots;
+        slots.reserve(n);
+        Slot max_slot = 0;
+
+        for (size_t i = 0; i < n; ++i) {
+            Key k;
+            KeyEntry e;
+            in.read(reinterpret_cast<char*>(&k), sizeof(k));
+            in.read(reinterpret_cast<char*>(&e.slot), sizeof(e.slot));
+            in.read(reinterpret_cast<char*>(&e.version), sizeof(e.version));
+            size_t pl;
+            in.read(reinterpret_cast<char*>(&pl), sizeof(pl));
+            if (pl > 0) {
+                e.payload.resize(pl);
+                in.read(reinterpret_cast<char*>(e.payload.data()), pl);
+            }
+            Slot slot = e.slot;
+            slot_key_.set(slot, k);
+            if (slot + 1 > max_slot) max_slot = slot + 1;
+            key_dir_.with_write(k, [&](KeyEntry& slot_entry, bool /*inserted*/) {
+                slot_entry = std::move(e);
+            });
+            slots.push_back(slot);
+        }
+        next_slot_.store(max_slot, std::memory_order_release);
+        live_count_.store(slots.size(), std::memory_order_release);
+
+        storage_.load_vectors(in, slots);
+
+        // Rebuild base HNSW from the freshly loaded KV.
+        rebuild();
+    }
+
     IndexConfig config_;
-    VectorStorage storage_;
-    KeyManager key_manager_;
-    HNSWIndex base_index_;
-    HNSWIndex delta_index_;
+    VectorStore storage_;
+    SlotKeyMap  slot_key_;
+    KeyDir      key_dir_;
+    std::unique_ptr<HnswGraph> base_graph_;
+    std::unique_ptr<HnswGraph> delta_graph_;
+    DeltaSet    delta_;
+    std::atomic<size_t> live_count_{0};
+    std::atomic<bool>   delta_hnsw_active_{false};
+    std::mutex          delta_hnsw_build_mutex_;
 
-    std::vector<std::unordered_map<Key, DeltaEntry>> delta_maps_;
-    mutable std::vector<std::shared_mutex> delta_mutexes_;
-    std::atomic<size_t> delta_size_;
-    std::atomic<bool> delta_hnsw_ready_;
-    std::unordered_set<Slot> delta_hnsw_slots_;
-    std::mutex delta_hnsw_mutex_;
-    std::atomic<uint64_t> delta_epoch_;
-
-    mutable std::shared_mutex base_mutex_;
-
+    std::atomic<Slot> next_slot_;
     std::atomic<bool> rebuild_running_;
-    std::thread rebuild_thread_;
+    std::thread       rebuild_thread_;
+    mutable std::shared_mutex base_swap_mutex_;
 };
 
 // ============================================================================
-// Index 公共接口
+// Index — public API forwarding
 // ============================================================================
-
-Index::Index(size_t dim, size_t max_elements, size_t delta_threshold) {
-    IndexConfig config;
-    config.max_elements = max_elements;
-    config.delta_bruteforce_limit = delta_threshold;
-    impl_ = std::make_unique<Impl>(dim, config);
-}
-
-Index::Index(size_t dim, const IndexConfig& config)
-    : impl_(std::make_unique<Impl>(dim, config)) {}
-
+Index::Index(const IndexConfig& config) : impl_(std::make_unique<Impl>(config)) {}
 Index::~Index() = default;
+Index::Index(Index&&) noexcept = default;
+Index& Index::operator=(Index&&) noexcept = default;
 
-Index::Index(Index&& other) noexcept = default;
-Index& Index::operator=(Index&& other) noexcept = default;
-
-bool Index::put(Key key, const float* vector) {
-    return impl_->put_with_data(key, vector, nullptr, 0);
+Status Index::put(Key key, const float* vector) {
+    return impl_->put(key, vector, nullptr, 0);
+}
+Status Index::put(Key key, const float* vector, const void* payload, size_t payload_len) {
+    return impl_->put(key, vector, payload, payload_len);
+}
+Status Index::del(Key key)            { return impl_->del(key); }
+bool   Index::exists(Key key) const   { return impl_->exists(key); }
+Status Index::get_payload(Key key, std::vector<uint8_t>& out) const {
+    return impl_->get_payload(key, out);
 }
 
-bool Index::put_with_data(Key key, const float* vector, const void* user_data, size_t user_data_len) {
-    return impl_->put_with_data(key, vector, user_data, user_data_len);
+Status Index::put_batch(const Key* keys, const float* vectors, size_t n, size_t* first_err) {
+    return impl_->put_batch(keys, vectors, n, first_err);
 }
 
-bool Index::del(Key key) {
-    return impl_->del(key);
+std::vector<SearchResult> Index::search(const float* query, const SearchParams& params) const {
+    return impl_->search(query, params);
 }
 
-bool Index::exists(Key key) const {
-    return impl_->exists(key);
+std::vector<std::vector<SearchResult>>
+Index::search_batch(const float* queries, size_t n, const SearchParams& params) const {
+    return impl_->search_batch(queries, n, params);
 }
 
-std::vector<uint8_t> Index::get_user_data(Key key) const {
-    return impl_->get_user_data(key);
-}
+Status Index::rebuild()                 { return impl_->rebuild(); }
+Status Index::rebuild_async()           { return impl_->rebuild_async(); }
+void   Index::wait_rebuild() const      { impl_->wait_rebuild(); }
 
-std::vector<SearchResult> Index::search(const float* query, int topk) {
-    return impl_->search(query, topk);
-}
+IndexStats         Index::stats() const  { return impl_->stats(); }
+const IndexConfig& Index::config() const { return impl_->config(); }
 
-void Index::rebuild() {
-    impl_->rebuild();
-}
-
-void Index::wait_rebuild() {
-    impl_->wait_rebuild();
-}
-
-IndexStats Index::stats() const {
-    return impl_->stats();
-}
-
-void Index::save(const std::string& path) const {
-    impl_->save(path);
-}
+Status Index::save(const std::string& path) const { return impl_->save(path); }
 
 std::unique_ptr<Index> Index::load(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("Cannot open file for reading: " + path);
-    }
+    if (!in) throw std::runtime_error("cannot open: " + path);
 
     char magic[8] = {};
     in.read(magic, sizeof(magic));
-    const char expected[8] = {'K','V','A','N','N','0','1','\0'};
-
-    if (std::memcmp(magic, expected, sizeof(magic)) == 0) {
-        uint32_t version = 0;
-        uint32_t reserved = 0;
-        in.read(reinterpret_cast<char*>(&version), sizeof(version));
-        in.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
-
-        size_t dim = 0;
-        size_t max_elements = 0;
-        size_t block_size = 0;
-        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-        in.read(reinterpret_cast<char*>(&max_elements), sizeof(max_elements));
-        in.read(reinterpret_cast<char*>(&block_size), sizeof(block_size));
-
-        IndexConfig config;
-        config.max_elements = max_elements;
-        config.storage_block_size = block_size;
-        auto index = std::make_unique<Index>(dim, config);
-        index->impl_->load_from_stream(in);
-        return index;
+    static const char expected[8] = {'K','V','A','N','N','0','2','\0'};
+    if (std::memcmp(magic, expected, sizeof(magic)) != 0) {
+        throw std::runtime_error("kvann: unsupported file format (need v2)");
+    }
+    uint32_t fmt_version = 0;
+    uint32_t reserved = 0;
+    in.read(reinterpret_cast<char*>(&fmt_version), sizeof(fmt_version));
+    in.read(reinterpret_cast<char*>(&reserved), sizeof(reserved));
+    if (fmt_version != 2) {
+        throw std::runtime_error("kvann: unsupported format version");
     }
 
-    in.clear();
-    in.seekg(0, std::ios::beg);
+    IndexConfig cfg;
+    in.read(reinterpret_cast<char*>(&cfg.dim), sizeof(size_t));
+    in.read(reinterpret_cast<char*>(&cfg.max_elements), sizeof(size_t));
+    in.read(reinterpret_cast<char*>(&cfg.storage_block_size), sizeof(size_t));
 
-    size_t dim = 0, max_elements = 0;
-    in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-    in.read(reinterpret_cast<char*>(&max_elements), sizeof(max_elements));
-    auto index = std::make_unique<Index>(dim, max_elements);
-    index->impl_->load_from_stream(in);
-    return index;
+    auto idx = std::make_unique<Index>(cfg);
+    idx->impl_->load_from_stream(in);
+    return idx;
 }
 
 } // namespace kvann

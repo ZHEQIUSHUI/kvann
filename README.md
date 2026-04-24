@@ -1,184 +1,136 @@
-# kvann - 动态向量检索引擎
+# kvann
 
-## 项目简介
+> 工业级动态向量检索引擎 — KV-first, ANN-second.
 
-kvann 是一个工业级、可动态更新的向量检索引擎，采用 **KV-first, ANN-second** 设计哲学。
+C++17，零外部依赖，跨 Linux / Windows × x86_64 / aarch64。
 
-## 核心特性
+## 特性
 
-### 单一版本（已实现）
-- **KV + Slot 映射**：Key 是外部唯一 ID，Slot 是内部连续编号
-- **Base/Delta 双层架构**：
-  - Base: 已 build 的只读 HNSW 索引
-  - Delta: 新增/更新的可变层，使用 brute-force
-- **HNSW (CPU)**：高效的近似最近邻搜索
-- **Cosine Similarity**：归一化向量 + 点积
-- **Tombstone 删除**：逻辑删除，支持立即生效
-- **手动 Rebuild**：将 Delta 层合并到 Base 层
-- **多线程查询**：读共享锁，写互斥锁
-- **持久化**：支持 save/load 冷启动恢复
-- **user_data 支持**：每个向量可附带自定义数据（文档、标签、元数据等）
-
-
-## 核心设计不变式
-
-1. **KV 是唯一真相** - 索引永远只是加速结构
-2. **删除/更新必须立即生效** - 不允许返回已删除/旧版本
-3. **索引允许滞后，语义不允许错误**
-4. **最终排序必须使用统一、精确的相似度**
-5. **任何 ANN 结构都允许被整体丢弃并重建**
+- **KV 是真相**：HNSW 仅作召回加速，最终排序用精确余弦 rerank
+- **Base / Delta 双层**：base 是已 build 的只读图，delta 是可写层（自动在 brute-force 与 HNSW 之间切换）
+- **Tombstone 删除**：立即生效，搜索永不返回已删 key
+- **手动 + 异步 rebuild**：snapshot 抓 (key, slot, vec) 后台构建新图，原子 swap，主路径不阻塞
+- **Seqlock 写入**：并发 put 不会让搜索看到撕裂的向量
+- **SIMD**：x86 AVX2+FMA / aarch64 NEON / 标量 fallback，编译期 dispatch
+- **批量 API**：`put_batch` / `search_batch`
+- **Payload**：每个 key 可挂任意二进制 user_data，搜索时按需返回
+- **Status 错误模型**：可读错误码 + 消息，调用方不用 try-catch
+- **可插拔 logger**：`IndexConfig::log_sink`
 
 ## 快速开始
 
-### 基础用法
-
 ```cpp
+#include <kvann/core.h>
 #include <kvann/index.h>
 
-// 创建索引
-kvann::Index index(128, 100000);  // 128维，最大10万向量
-
-// 可选配置
 kvann::IndexConfig cfg;
-cfg.hnsw_ef_search = 128;
-cfg.delta_hnsw_threshold = 5000;
-kvann::Index tuned(128, cfg);
+cfg.dim          = 128;
+cfg.max_elements = 1'000'000;
+kvann::Index index(cfg);
 
-// 插入向量
-std::vector<float> vec(128);
-// ... 填充向量数据 ...
-index.put(1, vec.data());
+// 插入
+index.put(/*key=*/42, vec.data());
+
+// 带 payload 插入
+index.put(43, vec.data(), payload.data(), payload.size());
 
 // 搜索
-auto results = index.search(query_vec.data(), 10);
+kvann::SearchParams sp;
+sp.topk            = 10;
+sp.include_payload = true;
+sp.filter          = [](kvann::Key k) { return k % 2 == 0; };
+
+auto results = index.search(query.data(), sp);
 for (const auto& r : results) {
-    std::cout << "key=" << r.key << " score=" << r.score << std::endl;
+    std::cout << "key=" << r.key << " score=" << r.score
+              << " payload_len=" << r.payload.size() << "\n";
 }
 
-// 重建索引（将 Delta 层合并到 Base 层）
-index.rebuild();
+// rebuild
+index.rebuild();          // 同步
+index.rebuild_async();    // 异步触发
 index.wait_rebuild();
-```
-
-### 带 user_data 的向量
-
-```cpp
-// 插入向量时附带自定义数据
-std::string metadata = "document_123:这是一篇文档";
-index.put_with_data(1, vec.data(), metadata.c_str(), metadata.size() + 1);
-
-// 搜索结果默认不包含 user_data（按需获取）
-auto results = index.search(query_vec.data(), 10);
-for (const auto& r : results) {
-    auto data = index.get_user_data(r.key);
-    std::string data_str(reinterpret_cast<const char*>(data.data()));
-    std::cout << "key=" << r.key << " data=" << data_str << std::endl;
-}
-```
-
-## API 参考
-
-### 核心类
-
-| 类 | 说明 | 适用场景 |
-|-----|------|---------|
-| `Index` | 基础索引 | 单机中等规模数据 |
-
-### 核心方法
-
-```cpp
-// 插入/更新
-bool put(Key key, const float* vector);
-bool put_with_data(Key key, const float* vector, const void* user_data, size_t len);
-
-// 删除
-bool del(Key key);
-
-// 查询
-bool exists(Key key);
-std::vector<uint8_t> get_user_data(Key key);
-std::vector<SearchResult> search(const float* query, int topk);
-
-// 重建
-void rebuild();
-void wait_rebuild();
 
 // 持久化
-void save(const std::string& path);
-static std::unique_ptr<Index> load(const std::string& path);
-
-// 统计
-IndexStats stats();
+index.save("/tmp/idx.bin");
+auto loaded = kvann::Index::load("/tmp/idx.bin");
 ```
 
-### SearchResult 结构
-
-```cpp
-struct SearchResult {
-    Key key;                        // 向量唯一键
-    float score;                    // 相似度分数（越高越相似）
-};
-```
-
-## 构建和测试
+## 构建
 
 ```bash
 mkdir build && cd build
-
-# 基础构建
-cmake .. -DBUILD_TESTS=ON
-make -j4
-
-# 启用 AVX2 优化
-cmake .. -DBUILD_TESTS=ON -DENABLE_AVX2=ON
-make -j4
-
-# 运行测试
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j
 ctest --output-on-failure
-# 或单独运行
-./test_v1        # 功能测试
-./test_user_data # user_data 功能测试
-
-# 运行示例
-./example
 ```
 
-## 项目结构
+CMake options:
 
-```
-kvann/
-├── include/kvann/
-│   ├── core.h           # 公共类型与工具函数
-│   ├── index.h          # 主索引类
-│   └── version.h        # 版本接口
-├── tests/
-│   ├── test_v1.cpp      # 功能测试（12个用例）
-│   └── test_user_data.cpp # user_data 测试（5个用例）
-├── example.cpp          # 使用示例
-└── CMakeLists.txt
-```
+| Option              | Default | 说明 |
+|---------------------|---------|------|
+| `KVANN_BUILD_TESTS`    | ON      | 单元测试 |
+| `KVANN_BUILD_EXAMPLES` | ON      | 示例程序 |
+| `KVANN_ENABLE_AVX2`    | ON      | x86_64 上启用 AVX2+FMA |
+| `KVANN_ENABLE_LTO`     | OFF     | Release 启用 LTO |
+| `BUILD_SHARED_LIBS`    | OFF     | 编共享库 |
 
-## 性能数据
+跨平台说明：
 
-### 基准
-- 插入 10,000 向量：~33ms
-- 重建 10,000 向量：~8s
-- 搜索（100次）：~130ms
-- Recall@10：> 0.95（通常 1.0）
+- **Linux / macOS / Windows**：CMake 探测平台、对齐分配自动切换 `posix_memalign` ↔ `_aligned_malloc`
+- **x86_64**：AVX2+FMA 默认开（运行时由 SIMD 后端自动选择）
+- **aarch64**：NEON（mandatory on aarch64，无需额外配置）
+- **其他**：标量 fallback
 
-## 设计文档
+`kvann::simd_backend()` 返回 `"avx2" / "neon" / "scalar"` 用于诊断。
 
-详见项目根目录的 `doc.md`，包含完整的需求规格与设计约束。
-### 本地序列化与冷启动
+## 集成
 
-支持本地序列化（`save`）与加载（`load`），用于冷启动直接恢复索引，无需重新构建。
-
-```cpp
-// 保存到本地文件
-index.save("/tmp/kvann.index");
-
-// 冷启动加载
-auto loaded = kvann::Index::load("/tmp/kvann.index");
+```cmake
+find_package(kvann CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE kvann::kvann)
 ```
 
-注意：当前持久化面向冷启动恢复，不保证 crash-safe（无 WAL）。
+## API 概览
+
+| 方法 | 说明 |
+|------|------|
+| `put(key, vec)` | 插入/更新 |
+| `put(key, vec, payload, len)` | 带 payload 插入 |
+| `put_batch(keys, vecs, n)` | 批量插入 |
+| `del(key)` | 逻辑删除 |
+| `exists(key)` | 是否存在 |
+| `get_payload(key, out)` | 按 key 取 payload |
+| `search(query, params)` | 单 query 搜索 |
+| `search_batch(queries, n, params)` | 批量搜索 |
+| `rebuild()` / `rebuild_async()` | 重建 base 图 |
+| `wait_rebuild()` | 等待异步重建结束 |
+| `save(path)` / `load(path)` | 持久化 |
+| `stats()` | 统计快照 |
+| `config()` | 当前配置 |
+
+## 性能（参考，128-d 单机 Linux x86_64 + AVX2）
+
+| 操作 | 量 | 时间 |
+|------|----|------|
+| Insert | 1k | ~4 ms |
+| Rebuild | 1k | ~190 ms |
+| Concurrent search (4 threads × 100q) | 400 q | ~17 ms |
+| Search | 100 q | ~15 ms |
+| Recall@10 | 1k base | 0.97+ |
+
+## 设计原则
+
+1. **KV 是唯一真相** — 索引永远只是加速结构
+2. **删除 / 更新立即生效** — 不允许返回已删除 / 旧版本
+3. **索引允许滞后，语义不允许错误**
+4. **最终排序用统一精确相似度**
+5. **任何 ANN 结构都允许整体丢弃并重建**
+
+## 当前限制（Roadmap）
+
+- 邻居选择仅 top-M（HNSW heuristic 多样性裁剪 — 跟 base recall 略有关）
+- HNSW 图持久化为重建（load 后会重新 build base）
+- 跨进程 mmap 加载未做
+- WAL / crash-safe 未做
+- 暂不支持量化 / GPU
