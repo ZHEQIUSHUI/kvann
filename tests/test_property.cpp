@@ -10,11 +10,14 @@
 #include <kvann/index.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <map>
 #include <random>
+#include <thread>
 #include <vector>
 
 using namespace kvann;
@@ -156,6 +159,51 @@ double run_seed(uint64_t seed, std::size_t dim, int n_ops, int n_keys, int topk)
     return std::min(mid, end);
 }
 
+// During concurrent rebuild, a search must still return correct top-1 (the
+// query is one of our seeded vectors, so the answer is the seeded key).
+// This catches "use stale graph that returns garbage" regressions.
+void test_concurrent_rebuild_returns_correct_results() {
+    constexpr std::size_t DIM = 32;
+    constexpr int N = 500;
+    Index idx(cfg_for(DIM, N * 4));
+    std::mt19937 rng(11);
+    std::vector<std::vector<float>> vecs(N);
+    for (int i = 0; i < N; ++i) {
+        vecs[i] = random_vec(DIM, rng);
+        idx.put(static_cast<Key>(i), vecs[i].data());
+    }
+    idx.rebuild();
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> wrong{0};
+    std::atomic<int> ok{0};
+
+    // Reader: each query is its own seeded vector; top-1 must be that key.
+    std::thread reader([&]() {
+        std::mt19937 r(33);
+        std::uniform_int_distribution<int> di(0, N - 1);
+        SearchParams sp; sp.topk = 1;
+        while (!stop.load()) {
+            int q = di(r);
+            auto out = idx.search(vecs[q].data(), sp);
+            if (out.empty() || (int)out[0].key != q) ++wrong;
+            else ++ok;
+        }
+    });
+    // Rebuilder: continuous rebuilds.
+    std::thread builder([&]() {
+        while (!stop.load()) {
+            (void)idx.rebuild();
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    stop.store(true);
+    reader.join(); builder.join();
+    TEST_ASSERT(ok > 0, "had successful searches");
+    TEST_ASSERT(wrong == 0,
+                "search during rebuild must keep returning correct top-1");
+}
+
 // Verify that delete eventually disappears from search results.
 void test_delete_disappears() {
     constexpr std::size_t DIM = 16;
@@ -199,6 +247,9 @@ void test_random_sequence() {
 int main() {
     std::cout << "==== property tests (SIMD: " << simd_backend() << ") ====\n";
     try {
+        std::cout << "[TEST] test_concurrent_rebuild_returns_correct_results...\n";
+        test_concurrent_rebuild_returns_correct_results();
+        std::cout << "[PASS]\n";
         std::cout << "[TEST] test_delete_disappears...\n";
         test_delete_disappears();
         std::cout << "[PASS]\n";
