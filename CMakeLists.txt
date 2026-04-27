@@ -13,6 +13,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Flatten output to build/ root regardless of generator (single-config or
+# multi-config like Visual Studio). CI scripts can then run ./kvann_bench
+# uniformly on every platform.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+foreach(_cfg IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOUPPER ${_cfg} _cfg_up)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_cfg_up} ${CMAKE_BINARY_DIR})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_cfg_up} ${CMAKE_BINARY_DIR})
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_cfg_up} ${CMAKE_BINARY_DIR})
+endforeach()
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
