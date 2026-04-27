@@ -8,14 +8,18 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 int main() {
     constexpr std::size_t DIM = 128;
     constexpr int N = 5000;
-    const char* PATH = "/tmp/kvann_persistence_demo.idx";
+    auto PATH_BUF = (std::filesystem::temp_directory_path()
+                     / "kvann_persistence_demo.idx").string();
+    const char* PATH = PATH_BUF.c_str();
 
     kvann::IndexConfig cfg;
     cfg.dim          = DIM;

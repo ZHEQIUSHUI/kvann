@@ -3,6 +3,8 @@
 #include <kvann/core.h>
 #include <kvann/index.h>
 
+#include "test_paths.h"
+
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -102,7 +104,7 @@ void test_update_payload() {
 
 void test_persistence_with_payload() {
     constexpr std::size_t DIM = 128;
-    const char* PATH = "/tmp/kvann_v2_userdata.index";
+    std::string PATH = kvann_test::tmp_path("kvann_v2_userdata.index");
     {
         Index index(cfg_for(DIM, 1000));
         std::vector<float> v(DIM, 0.5f);
@@ -118,7 +120,7 @@ void test_persistence_with_payload() {
         TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(p.data()),
                                 "persistent_12345") == 0, "content");
     }
-    std::remove(PATH);
+    std::remove(PATH.c_str());
     std::cout << "  [PASS] persistence with payload\n";
 }
 

@@ -6,6 +6,8 @@
 #include <kvann/core.h>
 #include <kvann/index.h>
 
+#include "test_paths.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -214,7 +216,7 @@ void test_rebuild() {
 void test_persistence() {
     constexpr std::size_t DIM = 128;
     constexpr int N = 100;
-    const char* PATH = "/tmp/kvann_v2_test.index";
+    std::string PATH = kvann_test::tmp_path("kvann_v2_test.index");
     std::mt19937 rng(42);
 
     std::vector<std::vector<float>> vecs;
@@ -239,7 +241,7 @@ void test_persistence() {
         idx->del(50);
         TEST_ASSERT(!idx->exists(50), "delete after load");
     }
-    std::remove(PATH);
+    std::remove(PATH.c_str());
 }
 
 void test_concurrent_search() {

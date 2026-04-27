@@ -9,6 +9,8 @@
 #include <kvann/core.h>
 #include <kvann/index.h>
 
+#include "test_paths.h"
+
 #include <cstdio>
 #include <iostream>
 #include <random>
@@ -94,7 +96,7 @@ void test_block_storage() {
 
 void test_persistence_header() {
     constexpr std::size_t DIM = 128;
-    const char* PATH = "/tmp/kvann_opt.index";
+    std::string PATH = kvann_test::tmp_path("kvann_opt.index");
     std::mt19937 rng(123);
 
     std::vector<std::vector<float>> vecs;
@@ -117,7 +119,7 @@ void test_persistence_header() {
         auto r = idx->search(vecs[0].data(), sp);
         TEST_ASSERT(!r.empty(), "search after load");
     }
-    std::remove(PATH);
+    std::remove(PATH.c_str());
     std::cout << "  [PASS] persistence header\n";
 }
 

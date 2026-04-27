@@ -11,6 +11,8 @@
 #include <kvann/core.h>
 #include <kvann/index.h>
 
+#include "test_paths.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -58,7 +60,7 @@ std::vector<float> random_vec(std::size_t dim, std::mt19937& rng) {
 // Write a small index to a temporary file. Returns path.
 std::string make_index_file(const std::string& tag, std::size_t n = 200,
                             std::size_t dim = 32) {
-    std::string path = "/tmp/kvann_corrupt_" + tag + ".idx";
+    std::string path = kvann_test::tmp_path("kvann_corrupt_" + tag + ".idx");
     Index idx(cfg_for(dim, n * 2));
     std::mt19937 rng(42);
     for (std::size_t i = 0; i < n; ++i) {
@@ -112,7 +114,7 @@ void test_roundtrip_preserves_search() {
     }
     orig.rebuild();
 
-    std::string path = "/tmp/kvann_rt_preserve.idx";
+    std::string path = kvann_test::tmp_path("kvann_rt_preserve.idx");
     TEST_ASSERT(orig.save(path).ok(), "save");
 
     auto loaded = Index::load(path);
@@ -140,8 +142,8 @@ void test_save_is_deterministic() {
     }
     idx.rebuild();
 
-    std::string a = "/tmp/kvann_det_a.idx";
-    std::string b = "/tmp/kvann_det_b.idx";
+    std::string a = kvann_test::tmp_path("kvann_det_a.idx");
+    std::string b = kvann_test::tmp_path("kvann_det_b.idx");
     TEST_ASSERT(idx.save(a).ok(), "save a");
     TEST_ASSERT(idx.save(b).ok(), "save b");
     auto da = read_file(a), db = read_file(b);
@@ -219,7 +221,7 @@ void test_load_bitflip_in_vectors() {
 void test_save_load_empty_index() {
     constexpr std::size_t DIM = 8;
     Index empty(cfg_for(DIM, 64));
-    std::string path = "/tmp/kvann_empty.idx";
+    std::string path = kvann_test::tmp_path("kvann_empty.idx");
     TEST_ASSERT(empty.save(path).ok(), "save empty");
     auto loaded = Index::load(path);
     auto s = loaded->stats();
@@ -239,7 +241,7 @@ void test_save_after_delete() {
     for (int i = 0; i < 25; ++i) idx.del(i);  // delete half
     idx.rebuild();
 
-    std::string path = "/tmp/kvann_after_del.idx";
+    std::string path = kvann_test::tmp_path("kvann_after_del.idx");
     TEST_ASSERT(idx.save(path).ok(), "save");
     auto loaded = Index::load(path);
     auto s = loaded->stats();
